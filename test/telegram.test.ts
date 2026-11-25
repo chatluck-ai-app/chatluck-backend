@@ -118,7 +118,7 @@ test('reminders: created via tool, delivered when due, late label; voice is refu
   assert.ok(tg.sent().at(-1)!.includes('⏰ تذكير: اتصل بأحمد')); assert.match(tg.sent().at(-1)!, /متأخراً/);
   assert.equal(await t.deliverDue(), 0); // not delivered twice
   await post({ message: { message_id: 9, chat: { id: 42, type: 'private' }, from: { id: 42 }, voice: { file_id: 'v' } } });
-  assert.match(tg.sent().at(-1)!, /غير مدعومة/);
+  assert.match(tg.sent().at(-1)!, /اكتبلي الطلب نص/);
   await app.close();
 });
 
