@@ -98,11 +98,14 @@ export async function runTask(db: Db, provider: Provider, taskId: string, emit: 
         continue;
       }
       // 2b. dev agent that only announced a plan: push it to actually do the work (cheap models often stop early)
-      if (agent.id === 'dev' && nudges < 4) {
+      if (agent.id === 'dev' && nudges < 8) {
         const made: any = await db.get('SELECT count(*) c FROM files WHERE task_id=?', taskId);
-        if (!Number(made.c)) {
+        const plan: any = await db.get('SELECT plan FROM project_plan WHERE task_id=?', taskId);
+        let missing = 0;
+        if (plan) { const pl = JSON.parse(plan.plan); const have = new Set(((await db.all('SELECT path FROM project_files WHERE task_id=?', taskId)) as any[]).map(x => x.path)); missing = pl.stages.flatMap((x: any) => x.files).filter((f: string) => !have.has(f)).length; }
+        if (!Number(made.c) || missing > 0) {
           nudges++; st.messages.push({ role: 'assistant', content: resp.content || '(no action)' });
-          st.messages.push({ role: 'user', content: 'You have not produced any file yet. Do not describe or promise: call the tools NOW (project_write with complete files, then build_apk or project_zip). Continue the work from where it stands.' });
+          st.messages.push({ role: 'user', content: 'The work is not finished (no deliverable yet, or planned files still missing). Do not describe or promise: call the tools NOW (project_write with the next missing files, then project_check, build_apk/run_tests, project_zip). Continue from where it stands.' });
           continue;
         }
       }
