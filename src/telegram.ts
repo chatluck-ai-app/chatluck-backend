@@ -88,12 +88,13 @@ export function registerTelegram(app: FastifyInstance, db: Db, svc: Service, opt
       await db.run('INSERT INTO tg_approvals(token,task_id,call_id,chat_id,user_id) VALUES(?,?,?,?,?)', token, ap.taskId, ap.callId, chat, user.id);
       await send(chat, `⏳ أحتاج موافقتك:\n${describeArgs(ap.tool, ap.args)}`, { reply_markup: { inline_keyboard: [[{ text: '✅ موافق', callback_data: `a:${token}:1` }, { text: '❌ رفض', callback_data: `a:${token}:0` }]] } });
     }
-    if (taskId) { const n = (await db.all('SELECT id FROM tasks WHERE user_id=? ORDER BY updated_at DESC LIMIT 50', user.id) as any[]).findIndex(r => r.id === taskId) + 1; await send(chat, `${STATUS_ICON[doneStatus] ?? ''} المهمة #${n} (${shortId(taskId)}): ${STATUS_AR[doneStatus] ?? doneStatus}`); }
+    if (taskId && (lines.length || doneStatus !== 'completed')) { const n = (await db.all('SELECT id FROM tasks WHERE user_id=? ORDER BY updated_at DESC LIMIT 50', user.id) as any[]).findIndex(r => r.id === taskId) + 1; await send(chat, `${STATUS_ICON[doneStatus] ?? ''} المهمة #${n} (${shortId(taskId)}): ${STATUS_AR[doneStatus] ?? doneStatus}`); }
+    return doneStatus;
   }
 
   async function runGoal(chat: string, link: any, goal: string, fileIds: string[]) {
     const user = { id: link.user_id, plan: 'owner' };
-    await present(chat, user, async (emit) => {
+    return await present(chat, user, async (emit) => {
       const ac = new AbortController();
       const r = await svc.start(user, { goal, agent: (link.agent && link.agent !== 'general') ? link.agent : (/(android studio|source code|مشروع برمج|مشروع اندرويد|مشروع أندرويد|كود كامل|الكود المصدري|ملفات برمجية|برمجي)/i.test(goal) ? 'dev' : 'general'), fileIds }, emit, ac.signal);
       if ('error' in r) { emit('error', { message: r.message }); return; }
@@ -105,7 +106,7 @@ export function registerTelegram(app: FastifyInstance, db: Db, svc: Service, opt
     const [cmd, ...rest] = text.trim().split(/\s+/); const arg = rest.join(' ');
     const c = cmd.toLowerCase().replace(/@\w+$/, '');
     if (c === '/start' || c === '/help') return send(chat, HELP);
-    if (c === '/tasks') {
+    if (c === '/tasks' || c === '/todo') {
       const rows = await db.all('SELECT id,title,status FROM tasks WHERE user_id=? ORDER BY updated_at DESC LIMIT 10', link.user_id) as any[];
       return send(chat, rows.length ? rows.map((r, i) => `${i + 1}. ${STATUS_ICON[r.status] ?? ''} ${r.title} (${shortId(r.id)})`).join('\n') : 'لا توجد مهام بعد.');
     }
@@ -197,7 +198,7 @@ export function registerTelegram(app: FastifyInstance, db: Db, svc: Service, opt
     if (String(msg.from?.id) !== String(link.tg_user_id)) return;
     // files
     const doc = msg.document ?? (msg.photo ? { file_id: msg.photo[msg.photo.length - 1].file_id, file_name: `photo_${msg.message_id}.jpg`, file_size: msg.photo[msg.photo.length - 1].file_size } : null);
-    if (msg.voice || msg.audio || msg.video || msg.video_note) return void send(chat, 'الرسائل الصوتية والفيديو غير مدعومة بعد. أرسل نصاً أو ملفاً.');
+    if (msg.voice || msg.audio || msg.video || msg.video_note) return void send(chat, 'لسه مش بقدر أسمع الصوت أو أشوف الفيديو هنا. اكتبلي الطلب نص (أو قولي محتوى الرسالة) وأنفذه فوراً 🙌');
     const fileIds: string[] = [];
     if (doc) {
       const name: string = doc.file_name ?? `file_${msg.message_id}`;
@@ -211,7 +212,10 @@ export function registerTelegram(app: FastifyInstance, db: Db, svc: Service, opt
     if (text.startsWith('/')) return void (await handleCommand(chat, link, text));
     const recent = await db.all("SELECT id FROM files WHERE user_id=? AND origin='upload' AND created_at>? ORDER BY created_at DESC LIMIT 3", link.user_id, Date.now() - 20 * 60_000) as any[];
     for (const r of recent) if (!fileIds.includes(r.id)) fileIds.push(r.id);
-    return void (await runGoal(chat, link, text, fileIds));
+    void api('setMessageReaction', { chat_id: chat, message_id: msg.message_id, reaction: [{ type: 'emoji', emoji: '👀' }] });
+    const st = await runGoal(chat, link, text, fileIds);
+    void api('setMessageReaction', { chat_id: chat, message_id: msg.message_id, reaction: [{ type: 'emoji', emoji: st === 'completed' ? '👍' : st === 'waiting_approval' ? '🤝' : '🤔' }] });
+    return;
   }
 
   // Reminder delivery. Runs while the server is awake; overdue reminders go out at the next wake-up, labelled late.
