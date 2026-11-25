@@ -27,14 +27,56 @@ jobs:
 `;
 export const DEFAULT_GRADLE_PROPERTIES = 'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\nandroid.useAndroidX=true\nandroid.nonTransitiveRClass=true\nkotlin.code.style=official\n';
 
-export interface BuildResult { ok: boolean; apk?: Buffer; apkName?: string; runUrl?: string; errorLines?: string; note?: string }
-export interface BuildOpts { token: string; repo: string; files: { path: string; content: string }[]; fetchImpl?: typeof fetch; signal?: AbortSignal; pollMs?: number; maxWaitMs?: number; id?: string }
+export interface BuildResult { ok: boolean; logTail?: string; apk?: Buffer; apkName?: string; runUrl?: string; errorLines?: string; note?: string }
+export interface BuildOpts { token: string; repo: string; files: { path: string; content: string }[]; fetchImpl?: typeof fetch; signal?: AbortSignal; pollMs?: number; maxWaitMs?: number; id?: string; workflow?: string; apk?: boolean; keepDefaultProps?: boolean }
 
 export function extractErrors(log: string, max = 40) {
   const lines = log.replace(/\u001b\[[0-9;]*m/g, '').split('\n').map(l => l.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, '').trimEnd());
   const hit = lines.filter(l => /(^e: |error:|FAILURE:|What went wrong|Execution failed|Could not |Unresolved reference|> Task .* FAILED|AAPT|Manifest merger)/i.test(l));
   const pick = hit.length ? hit : lines.filter(l => l.trim()).slice(-max);
   return pick.slice(-max).join('\n').slice(0, 5000);
+}
+
+const cleanTail = (log: string, n = 3500) => log.replace(/\u001b\[[0-9;]*m/g, '').split('\n').map(l => l.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, '')).filter(l => l.trim()).join('\n').slice(-n);
+
+export type CiKind = 'node' | 'python' | 'android' | 'web' | 'custom';
+/** Test workflow: the model-supplied command goes in .ci/run.sh (never interpolated into YAML) and runs on an ephemeral GitHub runner with read-only permissions and no secrets. */
+export function testWorkflow(kind: CiKind) {
+  const setup = kind === 'node' || kind === 'web' ? `      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'\n` : kind === 'python' ? `      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'\n` : kind === 'android' ? `      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'\n` : '';
+  return `name: run-tests
+on:
+  push:
+    branches: ['build-**']
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+${setup}      - name: Run
+        run: bash .ci/run.sh
+`;
+}
+export function testScript(kind: CiKind, command?: string) {
+  const dflt: Record<string, string> = {
+    node: '[ -f package.json ] && npm install --no-audit --no-fund; npm test --if-present',
+    web: '[ -f package.json ] && npm install --no-audit --no-fund; npm test --if-present; if [ ! -f package.json ]; then ls; echo "static site: checking html files"; for f in $(find . -name "*.html"); do test -s "$f" && echo "ok $f"; done; fi',
+    python: '[ -f requirements.txt ] && pip install -r requirements.txt; if ls test*.py tests 2>/dev/null | head -1 | grep -q .; then python -m pytest -q 2>&1 || python -m unittest discover -v; else python -m compileall -q . && echo compiled-ok; fi',
+    android: 'gradle testDebugUnitTest --no-daemon --console=plain',
+  };
+  return '#!/usr/bin/env bash\nset -o pipefail\n' + (command && command.trim() ? command.trim() : dflt[kind] ?? 'echo "no command given"; exit 1') + '\n';
 }
 
 export async function buildApk(o: BuildOpts): Promise<BuildResult> {
@@ -47,8 +89,8 @@ export async function buildApk(o: BuildOpts): Promise<BuildResult> {
   };
   const json = async (path: string, init?: any) => { const r = await call(path, init); const j: any = await r.json().catch(() => ({})); if (!r.ok) throw new Error(`GitHub ${r.status}: ${String(j.message ?? '').slice(0, 200)}`); return j; };
   const files = o.files.filter(x => !x.path.startsWith('.github/'));
-  if (!files.some(x => x.path === 'gradle.properties')) files.push({ path: 'gradle.properties', content: DEFAULT_GRADLE_PROPERTIES });
-  files.push({ path: '.github/workflows/build.yml', content: BUILD_WORKFLOW });
+  if (o.apk !== false && !files.some(x => x.path === 'gradle.properties')) files.push({ path: 'gradle.properties', content: DEFAULT_GRADLE_PROPERTIES });
+  files.push({ path: '.github/workflows/build.yml', content: o.workflow ?? BUILD_WORKFLOW });
   const branch = 'build-' + (o.id ?? Date.now().toString(36));
   const tree = await json('/git/trees', { method: 'POST', body: JSON.stringify({ tree: files.map(x => ({ path: x.path, mode: '100644', type: 'blob', content: x.content })) }) });
   const commit = await json('/git/commits', { method: 'POST', body: JSON.stringify({ message: 'build ' + branch, tree: tree.sha, parents: [] }) });
@@ -63,15 +105,16 @@ export async function buildApk(o: BuildOpts): Promise<BuildResult> {
       if (run?.status === 'completed') break;
     }
     if (!run || run.status !== 'completed') return { ok: false, note: 'انتهت مهلة الانتظار قبل اكتمال البناء', runUrl: run?.html_url };
-    if (run.conclusion !== 'success') {
-      let log = '';
+    let log = '';
+    if (run.conclusion !== 'success' || o.apk === false) {
       try {
         const jobs = await json(`/actions/runs/${run.id}/jobs`);
         const job = (jobs.jobs ?? []).find((x: any) => x.conclusion === 'failure') ?? jobs.jobs?.[0];
         if (job) { const r = await call(`/actions/jobs/${job.id}/logs`); log = await r.text(); }
       } catch { /* keep empty */ }
-      return { ok: false, runUrl: run.html_url, errorLines: extractErrors(log) || 'لا توجد سجلات متاحة', note: 'فشل البناء: ' + run.conclusion };
     }
+    if (run.conclusion !== 'success') return { ok: false, runUrl: run.html_url, errorLines: extractErrors(log) || 'لا توجد سجلات متاحة', logTail: cleanTail(log), note: 'فشل: ' + run.conclusion };
+    if (o.apk === false) return { ok: true, runUrl: run.html_url, logTail: cleanTail(log) };
     const arts = await json(`/actions/runs/${run.id}/artifacts`);
     const art = (arts.artifacts ?? [])[0]; if (!art) return { ok: false, runUrl: run.html_url, note: 'نجح البناء لكن لم يظهر ملف APK' };
     const r = await call(art.archive_download_url); if (!r.ok) throw new Error('artifact download failed: ' + r.status);
