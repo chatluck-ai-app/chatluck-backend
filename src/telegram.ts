@@ -228,6 +228,16 @@ export function registerTelegram(app: FastifyInstance, db: Db, svc: Service, opt
     }
     return rows.length;
   }
+  /** After a restart (free Render instances restart), tasks that were running died silently: tell the user instead of leaving them waiting. */
+  async function recoverInterrupted() {
+    const rows = await db.all("SELECT t.id, t.title, t.created_at, l.chat_id FROM tasks t JOIN tg_links l ON l.user_id=t.user_id WHERE t.status IN ('running','pending') AND t.created_at>?", Date.now() - 6 * 3600_000) as any[];
+    for (const r of rows) {
+      await db.run("UPDATE tasks SET status='failed', error=?, updated_at=? WHERE id=? AND status IN ('running','pending')", 'server restarted', Date.now(), r.id);
+      await send(String(r.chat_id), `⚠️ السيرفر المجاني اتعمله إعادة تشغيل وقطع مهمتك «${String(r.title ?? '').slice(0, 60)}». ابعتها تاني وهكمّلها من الأول.`).catch(() => {});
+    }
+    return rows.length;
+  }
+  if (!opt.sync) setTimeout(() => void recoverInterrupted().catch(() => {}), 5000).unref?.();
   let timer: any;
   if (!opt.sync) { timer = setInterval(() => void deliverDue().catch(() => {}), 30_000); timer.unref?.(); setTimeout(() => void deliverDue().catch(() => {}), 3000).unref?.(); app.addHook('onClose', async () => clearInterval(timer)); }
 
