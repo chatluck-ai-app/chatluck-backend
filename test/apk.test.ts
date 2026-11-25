@@ -39,3 +39,18 @@ test('buildApk: failure returns compiler error lines', async () => {
   assert.equal(r.ok, false); assert.ok(r.errorLines!.includes('Unresolved reference: foo')); assert.ok(!r.errorLines!.includes('noise'));
 });
 test('extractErrors falls back to the tail', () => assert.equal(extractErrors('a\nb\nc', 2), 'b\nc'));
+
+import { checkProject } from '../src/tools/index.ts';
+test('checkProject finds package, import, resource and xml problems and passes a consistent project', () => {
+  const good = [
+    { path: 'app/src/main/java/com/x/MainActivity.kt', content: 'package com.x\nimport com.x.data.Repo\nclass MainActivity { fun f() { R.layout.activity_main; R.string.app_name } }' },
+    { path: 'app/src/main/java/com/x/data/Repo.kt', content: 'package com.x.data\nclass Repo' },
+    { path: 'app/src/main/res/layout/activity_main.xml', content: '<LinearLayout><TextView android:text="@string/app_name"/></LinearLayout>' },
+    { path: 'app/src/main/res/values/strings.xml', content: '<resources><string name="app_name">A</string></resources>' },
+    { path: 'app/src/main/AndroidManifest.xml', content: '<manifest><application><activity android:name=".MainActivity"/></application></manifest>' },
+  ];
+  assert.deepEqual(checkProject(good), []);
+  const bad = [...good.slice(1), { path: 'app/src/main/java/com/x/MainActivity.kt', content: 'package com.x\nimport com.x.data.Missing\nclass MainActivity { R.string.nope }' }, { path: 'app/src/main/java/com/x/Other.kt', content: 'package com.y\nclass Other' }, { path: 'a.xml', content: '<a><b></a>' }];
+  const iss = checkProject(bad).join('|');
+  assert.ok(iss.includes('does not match its folder') && iss.includes('Missing') && iss.includes('string/nope') && iss.includes('a.xml'));
+});
