@@ -1,4 +1,4 @@
-import type { Provider, ProviderModel, ChatMsg } from './types.ts';
+import type { Provider, ProviderModel, ChatMsg, ToolSpec, ToolCall } from './types.ts';
 /** One adapter for any OpenAI-compatible endpoint (OpenAI itself, and Gemini's compat endpoint). */
 export class OpenAICompat implements Provider {
   name: string; private base: string; private key: string; private candidates: string[];
@@ -16,6 +16,34 @@ export class OpenAICompat implements Provider {
       } catch { /* unavailable */ }
     }
     return out;
+  }
+  async chat(model: string, messages: ChatMsg[], tools: ToolSpec[], signal: AbortSignal): Promise<{ content: string; toolCalls: ToolCall[] }> {
+    const body: any = { model, messages };
+    if (tools.length) body.tools = tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
+    const r = await fetch(this.base + '/chat/completions', { method: 'POST', headers: this.headers(), signal, body: JSON.stringify(body) });
+    if (!r.ok) throw new ProviderError(r.status, (await r.text().catch(() => '')).slice(0, 300));
+    const m = (await r.json() as any).choices?.[0]?.message ?? {};
+    const toolCalls: ToolCall[] = (m.tool_calls ?? []).map((c: any, i: number) => ({ id: c.id || 'call_' + i + '_' + Date.now(), name: c.function?.name, arguments: c.function?.arguments ?? '{}' }));
+    return { content: typeof m.content === 'string' ? m.content : '', toolCalls };
+  }
+  /** Gemini only: Google Search grounding through the native API. */
+  async search(query: string, signal: AbortSignal) {
+    const native = this.base.replace(/\/openai\/?$/, '');
+    if (!this.key || native === this.base) throw new ProviderError(501, 'search not supported by this provider');
+    const model = process.env.GEMINI_SEARCH_MODEL ?? this.candidates[0];
+    const r = await fetch(`${native}/models/${model}:generateContent`, { method: 'POST', signal,
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': this.key },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: query }] }], tools: [{ google_search: {} }] }) });
+    if (!r.ok) throw new ProviderError(r.status, (await r.text().catch(() => '')).slice(0, 300));
+    const j: any = await r.json(); const cand = j.candidates?.[0];
+    const answer = (cand?.content?.parts ?? []).map((p: any) => p.text ?? '').join('');
+    const seen = new Set<string>(); const sources: { title: string; url: string }[] = [];
+    for (const ch of cand?.groundingMetadata?.groundingChunks ?? []) {
+      let url: string = ch.web?.uri; if (!url || seen.has(url)) continue; seen.add(url);
+      try { const h = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(5000) }); if (h.url) url = h.url; } catch { /* keep redirect url */ }
+      sources.push({ title: ch.web?.title ?? url, url });
+    }
+    return { answer, sources };
   }
   async *chatStream(model: string, messages: ChatMsg[], signal: AbortSignal) {
     const r = await fetch(this.base + '/chat/completions', { method: 'POST', headers: this.headers(), signal,
