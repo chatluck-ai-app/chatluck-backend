@@ -95,7 +95,7 @@ export function registerTelegram(app: FastifyInstance, db: Db, svc: Service, opt
     const user = { id: link.user_id, plan: 'owner' };
     await present(chat, user, async (emit) => {
       const ac = new AbortController();
-      const r = await svc.start(user, { goal, agent: link.agent || 'general', fileIds }, emit, ac.signal);
+      const r = await svc.start(user, { goal, agent: (link.agent && link.agent !== 'general') ? link.agent : (/(android studio|source code|مشروع برمج|مشروع اندرويد|مشروع أندرويد|كود كامل|الكود المصدري|ملفات برمجية|برمجي)/i.test(goal) ? 'dev' : 'general'), fileIds }, emit, ac.signal);
       if ('error' in r) { emit('error', { message: r.message }); return; }
       await r.run();
     });
