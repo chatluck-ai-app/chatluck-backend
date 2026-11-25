@@ -175,25 +175,40 @@ async function saveGenerated(ctx: ToolCtx, name: string, mime: string, buf: Buff
   return id;
 }
 const generateImage: Tool = {
-  name: 'generate_image', description: 'Generate a new image from a text prompt (free Pollinations service, no key). Write the prompt in English for best results (translate Arabic requests). Returns a file the user receives.',
+  name: 'generate_image', description: 'Generate a new image from a text prompt (free services, no key: Pollinations, then Stable Horde). Write the prompt in English for best results (translate Arabic requests). Returns a file the user receives.',
   parameters: { type: 'object', properties: { prompt: { type: 'string' }, width: { type: 'integer' }, height: { type: 'integer' }, seed: { type: 'integer' } }, required: ['prompt'] },
   async run({ prompt, width, height, seed }, ctx) {
-    const w = Math.min(1536, Math.max(256, Number(width) || 1024)), h = Math.min(1536, Math.max(256, Number(height) || 1024));
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(String(prompt).slice(0, 800))}?width=${w}&height=${h}&nologo=true&seed=${Number.isInteger(seed) ? seed : Math.floor(Math.random() * 1e6)}`;
-    const f = ctx.fetchImpl ?? fetch; let buf: Buffer | undefined, lastErr = '';
-    for (let i = 0; i < 3 && !buf; i++) {
-      try {
-        const r = await f(url, { signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(90000)]) });
-        if (!r.ok) { lastErr = 'HTTP ' + r.status; await new Promise(res => setTimeout(res, 3000)); continue; }
-        const b = Buffer.from(await r.arrayBuffer()); if (b.length > 1000 && /^image\//.test(r.headers.get('content-type') ?? '')) buf = b; else lastErr = 'not an image';
-      } catch (e: any) { lastErr = String(e?.message ?? e); }
-    }
-    if (!buf) throw new Error('image service unavailable (' + lastErr + ')');
+    const w = Math.min(1536, Math.max(256, Number(width) || 1024)), h = Math.min(1536, Math.max(256, Number(height) || 1024)); let used = '';
+    const f = ctx.fetchImpl ?? fetch; const text = String(prompt).slice(0, 800); const sd = Number.isInteger(seed) ? seed : Math.floor(Math.random() * 1e6);
+    const sig = () => AbortSignal.any([ctx.signal, AbortSignal.timeout(60000)]);
+    const grab = async (url: string) => { const r = await f(url, { signal: sig() }); if (!r.ok) throw new Error('HTTP ' + r.status); const b = Buffer.from(await r.arrayBuffer()); if (b.length < 1000) throw new Error('empty image'); return b; };
+    const providers: [string, () => Promise<Buffer>][] = [
+      ['pollinations', () => grab(`https://gen.pollinations.ai/image/${encodeURIComponent(text)}?width=${w}&height=${h}&nologo=true&seed=${sd}`)],
+      ['pollinations-legacy', () => grab(`https://image.pollinations.ai/prompt/${encodeURIComponent(text)}?width=${w}&height=${h}&nologo=true&seed=${sd}`)],
+      ['stablehorde', async () => { // free anonymous community GPU network; queue time varies
+        const hw = Math.min(768, Math.round(w / 64) * 64), hh = Math.min(768, Math.round(h / 64) * 64);
+        const hdr = { 'content-type': 'application/json', apikey: '0000000000', 'client-agent': 'chatluck:1.0:anon' };
+        const r = await f('https://stablehorde.net/api/v2/generate/async', { method: 'POST', headers: hdr, signal: sig(), body: JSON.stringify({ prompt: text, params: { width: hw, height: hh, steps: 25, n: 1 }, nsfw: false, censor_nsfw: true, r2: true }) });
+        const j: any = await r.json().catch(() => ({})); if (!j.id) throw new Error('horde: ' + (j.message ?? r.status));
+        for (let i = 0; i < 20; i++) {
+          await new Promise(res => setTimeout(res, 4000)); if (ctx.signal.aborted) throw new Error('canceled');
+          const c: any = await (await f(`https://stablehorde.net/api/v2/generate/check/${j.id}`, { signal: sig() })).json().catch(() => ({}));
+          if (c.faulted) throw new Error('horde faulted'); if (c.done) break;
+          if (i === 19) throw new Error('horde queue too long');
+        }
+        const st: any = await (await f(`https://stablehorde.net/api/v2/generate/status/${j.id}`, { signal: sig() })).json();
+        const img = st.generations?.[0]?.img; if (!img) throw new Error('horde returned no image');
+        return grab(img);
+      }],
+    ];
+    let buf: Buffer | undefined; const errs: string[] = [];
+    for (const [name, fn] of providers) { try { buf = await fn(); if (buf) { used = name; break; } } catch (e: any) { errs.push(name + ': ' + String(e?.message ?? e).slice(0, 60)); } }
+    if (!buf) throw new Error('all free image services failed (' + errs.join('; ') + ')');
     const sharp: any = (await import('sharp')).default; const meta = await sharp(buf).metadata();
     if (!meta.width || !meta.height) throw new Error('generated file is not a valid image');
-    const ext = meta.format === 'png' ? 'png' : 'jpg'; const name = 'image_' + Date.now() + '.' + ext;
-    const id = await saveGenerated(ctx, name, ext === 'png' ? 'image/png' : 'image/jpeg', buf);
-    return { output: { file_id: id, name, width: meta.width, height: meta.height, note: 'Generated by the free Pollinations service (the prompt is sent to them).' }, verified: { ok: true, detail: `الصورة فُتحت وتم التحقق منها (${meta.width}x${meta.height})` }, fileId: id };
+    const ext = meta.format === 'png' ? 'png' : meta.format === 'webp' ? 'webp' : 'jpg'; const name = 'image_' + Date.now() + '.' + ext;
+    const id = await saveGenerated(ctx, name, ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg', buf);
+    return { output: { file_id: id, name, width: meta.width, height: meta.height, provider: used, note: 'Generated by a free third-party image service (the prompt is sent to it).' }, verified: { ok: true, detail: `الصورة فُتحت وتم التحقق منها (${meta.width}x${meta.height})` }, fileId: id };
   },
 };
 const editImage: Tool = {
