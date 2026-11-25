@@ -6,6 +6,9 @@ import { hashPassword, verifyPassword, signToken, verifyToken } from './auth.ts'
 import { ModelRegistry, buildProviders } from './providers/registry.ts';
 import type { Provider } from './providers/types.ts';
 import { ProviderError } from './providers/openaiCompat.ts';
+import { makeService, registerPhase2 } from './phase2.ts';
+import { memoryPrompt } from './memory.ts';
+import { registerTelegram, type TgOptions } from './telegram.ts';
 
 const BUILTIN = [
   ['general', 'مساعد عام', 'You are a helpful assistant. Answer in the user\'s language, structured and accurate. If you do not know, say so instead of inventing.'],
@@ -16,7 +19,7 @@ const BUILTIN = [
 ] as const;
 const STYLES: Record<string, string> = { formal: 'formal', natural: 'natural and fluent', academic: 'academic', simple: 'simple and easy' };
 
-export async function buildApp(opts: { db?: Db; providers?: Provider[] } = {}) {
+export async function buildApp(opts: { db?: Db; providers?: Provider[]; telegram?: TgOptions } = {}) {
   const db = opts.db ?? await openDb();
   const registry = new ModelRegistry(opts.providers ?? buildProviders());
   const app = Fastify({ logger: { level: 'info', redact: ['req.headers.authorization'] }, bodyLimit: 1_000_000 });
@@ -32,7 +35,7 @@ export async function buildApp(opts: { db?: Db; providers?: Provider[] } = {}) {
     const k = req.ip, h = hits.get(k);
     if (!h || now() - h.t > 60_000) hits.set(k, { n: 1, t: now() });
     else if (++h.n > 120) return rep.code(429).send({ error: 'rate_limited', message: 'طلبات كثيرة، حاول بعد دقيقة.' });
-    if (req.url === '/health' || req.url.startsWith('/v1/auth/')) return;
+    if (req.url === '/health' || req.url.startsWith('/v1/auth/') || req.url.startsWith('/telegram/')) return;
     const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? '');
     const uid = m && verifyToken(m[1], config.jwtSecret);
     const u: any = uid && await db.get('SELECT * FROM users WHERE id=?', uid);
@@ -136,7 +139,7 @@ export async function buildApp(opts: { db?: Db; providers?: Provider[] } = {}) {
       await db.run('INSERT INTO messages(id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?)', randomUUID(), c.id, 'user', b.content, mts());
     }
     const asst: any = await db.get('SELECT instructions FROM assistants WHERE id=? AND (builtin=1 OR user_id=?)', c.assistant_id ?? 'general', u.id);
-    let sys = asst?.instructions ?? '';
+    let sys = (asst?.instructions ?? '') + await memoryPrompt(db, u.id);
     if (b.style && STYLES[b.style]) sys += ` Translation style: ${STYLES[b.style]}.`;
     const history = await db.all('SELECT role,content FROM messages WHERE conversation_id=? ORDER BY created_at', c.id) as any[];
     const msgs = [...(sys ? [{ role: 'system' as const, content: sys }] : []), ...history.slice(-40)];
@@ -165,6 +168,11 @@ export async function buildApp(opts: { db?: Db; providers?: Provider[] } = {}) {
     rep.raw.end();
   });
 
+  const svc = makeService(db, registry); registerPhase2(app, db, svc, U);
+  const tgCfg = opts.telegram ?? (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_PAIRING_CODE ? { token: process.env.TELEGRAM_BOT_TOKEN, pairingCode: process.env.TELEGRAM_PAIRING_CODE } : undefined);
+  const telegram = tgCfg ? registerTelegram(app, db, svc, tgCfg) : undefined;
+  if (telegram && !opts.telegram && process.env.PUBLIC_URL) app.addHook('onReady', async () => { try { await telegram.setup(process.env.PUBLIC_URL!); } catch (e: any) { app.log.error({ err: String(e?.message) }, 'telegram setup failed'); } });
+  (app as any).telegram = telegram;
   app.get('/v1/admin/stats', async (req, rep) => {
     if (!U(req).is_admin) return rep.code(403).send({ error: 'forbidden' });
     const g = async (s: string) => Number((await db.get(s)).c);
