@@ -7,6 +7,7 @@ export const MIME: Record<string, string> = {
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   pdf: 'application/pdf', zip: 'application/zip', txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', json: 'application/json',
+  py: 'text/x-python', java: 'text/x-java', kt: 'text/x-kotlin', html: 'text/html', css: 'text/css', js: 'text/javascript', ts: 'text/typescript', xml: 'application/xml', yml: 'text/yaml', yaml: 'text/yaml', sql: 'text/plain', gradle: 'text/plain', kts: 'text/plain', properties: 'text/plain', toml: 'text/plain',
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
 };
 export const extOf = (name: string) => (name.split('.').pop() ?? '').toLowerCase();
@@ -40,7 +41,7 @@ export async function extractText(name: string, buf: Buffer): Promise<string> {
       parts.push(`--- شريحة ${i + 1} ---\n${t}`);
     }
     text = parts.join('\n');
-  } else if (['txt', 'md', 'csv', 'json'].includes(ext)) text = buf.toString('utf8');
+  } else if (['txt', 'md', 'csv', 'json', 'py', 'java', 'kt', 'html', 'css', 'js', 'ts', 'xml', 'yml', 'yaml', 'sql', 'gradle', 'kts', 'properties', 'toml'].includes(ext)) text = buf.toString('utf8');
   else throw new Error('نوع الملف غير مدعوم: ' + ext);
   return text.slice(0, MAX_TEXT);
 }
