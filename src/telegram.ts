@@ -247,10 +247,13 @@ export function registerTelegram(app: FastifyInstance, db: Db, svc: Service, opt
   }
   /** After a restart (free Render instances restart), tasks that were running died silently: tell the user instead of leaving them waiting. */
   async function recoverInterrupted() {
-    const rows = await db.all("SELECT t.id, t.title, t.created_at, l.chat_id FROM tasks t JOIN tg_links l ON l.user_id=t.user_id WHERE t.status IN ('running','pending') AND t.created_at>?", Date.now() - 6 * 3600_000) as any[];
+    const rows = await db.all("SELECT t.id, t.title, t.error, t.user_id, l.chat_id FROM tasks t JOIN tg_links l ON l.user_id=t.user_id WHERE t.status IN ('running','pending') AND t.updated_at>?", Date.now() - 3 * 3600_000) as any[];
     for (const r of rows) {
-      await db.run("UPDATE tasks SET status='failed', error=?, updated_at=? WHERE id=? AND status IN ('running','pending')", 'server restarted', Date.now(), r.id);
-      await send(String(r.chat_id), `⚠️ السيرفر المجاني اتعمله إعادة تشغيل وقطع مهمتك «${String(r.title ?? '').slice(0, 60)}». ابعتها تاني وهكمّلها من الأول.`).catch(() => {});
+      const n = Number(String(r.error ?? '').match(/^resumed:(\d+)/)?.[1] ?? 0);
+      if (n >= 2) { await db.run("UPDATE tasks SET status='failed', error=?, updated_at=? WHERE id=?", 'server restarted repeatedly', Date.now(), r.id); await send(String(r.chat_id), `⚠️ مهمتك «${String(r.title ?? '').slice(0, 60)}» اتقطعت أكتر من مرة بسبب إعادة تشغيل السيرفر. ابعتها تاني.`).catch(() => {}); continue; }
+      await db.run('UPDATE tasks SET error=? WHERE id=?', 'resumed:' + (n + 1), r.id);
+      await send(String(r.chat_id), `🔄 السيرفر اتعمله إعادة تشغيل، بكمّل مهمتك «${String(r.title ?? '').slice(0, 60)}» من حيث وقفت (الملفات محفوظة).`).catch(() => {});
+      void present(String(r.chat_id), { id: r.user_id, plan: 'owner' }, async (emit) => { const x = await svc.restart(r.id, emit, new AbortController().signal); if (!x) { emit('error', { message: 'تعذر استكمال المهمة' }); return; } await x.run(); }).catch(() => {});
     }
     return rows.length;
   }
