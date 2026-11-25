@@ -66,7 +66,7 @@ export function registerTelegram(app: FastifyInstance, db: Db, svc: Service, opt
     const lines: string[] = []; let statusMsg: number | null = null; let finalText = ''; let doneStatus = ''; let taskId = '';
     const files: string[] = []; const approvals: any[] = []; let err = '';
     const typing = setInterval(() => void api('sendChatAction', { chat_id: chat, action: 'typing' }), 4000); void api('sendChatAction', { chat_id: chat, action: 'typing' });
-    const stepNames: Record<string, string> = { web_search: 'بحث على الإنترنت', web_read: 'قراءة صفحة', read_file: 'قراءة ملف', create_document: 'إنشاء ملف', save_memory: 'حفظ في الذاكرة', create_reminder: 'إنشاء تذكير', list_reminders: 'عرض التذكيرات', cancel_reminder: 'إلغاء تذكير' };
+    const stepNames: Record<string, string> = { web_search: 'بحث على الإنترنت', web_read: 'قراءة صفحة', read_file: 'قراءة ملف', create_document: 'إنشاء ملف', generate_image: 'توليد صورة', edit_image: 'تعديل صورة', project_write: 'كتابة ملفات المشروع', project_zip: 'تجميع المشروع', save_memory: 'حفظ في الذاكرة', create_reminder: 'إنشاء تذكير', list_reminders: 'عرض التذكيرات', cancel_reminder: 'إلغاء تذكير' };
     const evs: [string, any][] = [];
     try { await runner((e, d) => evs.push([e, d])); } finally { clearInterval(typing); }
     for (const [e, d] of evs) {
