@@ -23,7 +23,7 @@ export class OpenAICompat implements Provider {
     const r = await fetch(this.base + '/chat/completions', { method: 'POST', headers: this.headers(), signal, body: JSON.stringify(body) });
     if (!r.ok) throw new ProviderError(r.status, (await r.text().catch(() => '')).slice(0, 300));
     const m = (await r.json() as any).choices?.[0]?.message ?? {};
-    const toolCalls: ToolCall[] = (m.tool_calls ?? []).map((c: any, i: number) => ({ id: c.id || 'call_' + i + '_' + Date.now(), name: c.function?.name, arguments: c.function?.arguments ?? '{}' }));
+    const toolCalls: ToolCall[] = (m.tool_calls ?? []).map((c: any, i: number) => ({ id: c.id || 'call_' + i + '_' + Date.now(), name: c.function?.name, arguments: c.function?.arguments ?? '{}', extra: c.extra_content }));
     return { content: typeof m.content === 'string' ? m.content : '', toolCalls };
   }
   /** Gemini only: Google Search grounding through the native API. */
