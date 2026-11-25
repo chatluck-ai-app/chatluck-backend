@@ -126,3 +126,23 @@ test('agent: model call limit stops runaway loops', async () => {
   const { evs } = await run(app, token, { goal: 'loop' });
   assert.equal(evs.at(-1)!.data.status, 'failed');
 });
+
+test('dev agent: writes many files in batches, zips, zip is re-opened and valid; compact args; bad path rejected', async () => {
+  const mk = (n: number, off: number) => Array.from({ length: n }, (_, i) => ({ path: `app/src/main/java/com/x/F${off + i}.kt`, content: `package com.x\nclass F${off + i}` }));
+  const core = [{ path: 'settings.gradle.kts', content: 'include(":app")' }, { path: 'build.gradle.kts', content: '// root' }, { path: 'app/build.gradle.kts', content: '// app' }, { path: 'app/src/main/AndroidManifest.xml', content: '<manifest/>' }];
+  const script: any[] = [
+    () => ({ toolCalls: [call('project_write', { files: [{ path: '../evil.txt', content: 'x' }] })] }),
+    () => ({ toolCalls: [call('project_write', { files: [...core, ...mk(11, 0)] }, 'w1')] }),
+    () => ({ toolCalls: [call('project_write', { files: mk(12, 100) }, 'w2')] }),
+    (m: ChatMsg[]) => { const asst = m.filter(x => x.role === 'assistant') as any[]; assert.ok(!JSON.stringify(asst).includes('class F100'), 'old file bodies are compacted out of the context'); return { toolCalls: [call('project_zip', { name: 'App', kind: 'android' })] }; },
+    () => ({ content: 'done' }),
+  ];
+  const { app, token } = await setup(script);
+  const { evs } = await run(app, token, { goal: 'generate android studio project', agent: 'dev' });
+  assert.equal(evs.at(-1)!.data.status, 'completed');
+  const f = evs.find(e => e.ev === 'file')!.data; assert.equal(f.name, 'App.zip');
+  const dl = await app.inject({ method: 'GET', url: '/v1/files/' + f.fileId + '/download', headers: H(token) });
+  const JSZip: any = (await import('jszip')).default; const z = await JSZip.loadAsync(dl.rawPayload);
+  assert.equal(Object.keys(z.files).filter((n: string) => !z.files[n].dir).length, 4 + 11 + 12);
+  assert.ok((await z.file('app/src/main/java/com/x/F105.kt').async('string')).includes('class F105'));
+});
