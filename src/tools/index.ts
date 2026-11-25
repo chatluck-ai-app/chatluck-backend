@@ -137,7 +137,85 @@ const projectWrite: Tool = {
     for (const f of files) { await ctx.db.run('DELETE FROM project_files WHERE task_id=? AND path=?', ctx.taskId, f.path); await ctx.db.run('INSERT INTO project_files(task_id,path,content) VALUES(?,?,?)', ctx.taskId, f.path, f.content); }
     const n: any = await ctx.db.get('SELECT count(*) c FROM project_files WHERE task_id=?', ctx.taskId);
     const all = await ctx.db.all('SELECT path FROM project_files WHERE task_id=? ORDER BY path', ctx.taskId) as any[];
-    return { output: { saved: files.map((f: any) => f.path), total_files: Number(n.c), already_identical: same.length ? same : undefined, all_paths_so_far: all.slice(0, 300).map(r => r.path), next: same.length ? 'These files were already saved with identical content: do NOT rewrite them. Write only files that are still missing, then call build_apk.' : 'Write only the files still missing from your plan (see all_paths_so_far), then call build_apk. Never rewrite a file that is already listed.' } };
+    const plan = await planProgress(ctx);
+    return { output: { saved: files.map((f: any) => f.path), total_files: Number(n.c), plan: plan ? { missing_total: plan.missing_total, current_stage: plan.current_stage, write_next: plan.write_next } : undefined, already_identical: same.length ? same : undefined, all_paths_so_far: all.slice(0, 300).map(r => r.path), next: same.length ? 'These files were already saved with identical content: do NOT rewrite them. Write only files that are still missing, then call build_apk.' : 'Write only the files still missing from your plan (see all_paths_so_far), then call build_apk. Never rewrite a file that is already listed.' } };
+  },
+};
+async function planProgress(ctx: ToolCtx) {
+  const r: any = await ctx.db.get('SELECT plan FROM project_plan WHERE task_id=?', ctx.taskId); if (!r) return null;
+  const plan = JSON.parse(r.plan) as { name: string; stages: { title: string; files: string[] }[] };
+  const have = new Set(((await ctx.db.all('SELECT path FROM project_files WHERE task_id=?', ctx.taskId)) as any[]).map(x => x.path));
+  const stages = plan.stages.map(st => ({ title: st.title, missing: st.files.filter(f => !have.has(f)), total: st.files.length }));
+  const cur = stages.find(st => st.missing.length);
+  return { name: plan.name, stages, missing_total: stages.reduce((a, b) => a + b.missing.length, 0), current_stage: cur ? cur.title : null, write_next: cur ? cur.missing.slice(0, 8) : [] };
+}
+const projectPlan: Tool = {
+  name: 'project_plan', description: 'For any project of more than ~12 files: save the build plan FIRST as stages (e.g. 1 gradle/config, 2 data layer, 3 screens...), each stage listing the exact file paths (6-10 files per stage, max 12 stages, max 300 files). Afterwards write stage by stage; project_write reports what is still missing. Call again to revise the plan.',
+  parameters: { type: 'object', properties: { name: { type: 'string' }, stages: { type: 'array', items: { type: 'object', properties: { title: { type: 'string' }, files: { type: 'array', items: { type: 'string' } } }, required: ['title', 'files'] } } }, required: ['name', 'stages'] },
+  async run({ name, stages }, ctx) {
+    if (!Array.isArray(stages) || !stages.length || stages.length > 12) throw new Error('1 to 12 stages');
+    const all = stages.flatMap((x: any) => x?.files ?? []); if (all.length > 300) throw new Error('max 300 files in a plan');
+    for (const f of all) if (!SAFE_PATH(f)) throw new Error('invalid path in plan: ' + String(f).slice(0, 80));
+    await ctx.db.run('DELETE FROM project_plan WHERE task_id=?', ctx.taskId);
+    await ctx.db.run('INSERT INTO project_plan(task_id,plan) VALUES(?,?)', ctx.taskId, JSON.stringify({ name: String(name).slice(0, 80), stages: stages.map((x: any) => ({ title: String(x.title).slice(0, 80), files: x.files })) }));
+    return { output: { saved: true, stages: stages.length, files_planned: all.length, next: 'Write stage 1 now with project_write (6-8 files per call), then project_check, then the next stage.' } };
+  },
+};
+export function checkProject(rows: { path: string; content: string }[]) {
+  const issues: string[] = []; const byPath = new Map(rows.map(r => [r.path, r.content]));
+  // XML well-formedness and JSON validity
+  for (const r of rows) {
+    if (/\.xml$/i.test(r.path)) {
+      const src = r.content.replace(/<!--[\s\S]*?-->/g, '').replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '').replace(/<\?[\s\S]*?\?>/g, ''); const stack: string[] = [];
+      for (const m of src.matchAll(/<(\/?)([A-Za-z_][\w.:-]*)((?:"[^"]*"|'[^']*'|[^>"'])*?)(\/?)>/g)) {
+        if (m[4]) continue; if (!m[1]) stack.push(m[2]); else { const top = stack.pop(); if (top !== m[2]) { issues.push(`${r.path}: XML tag mismatch (</${m[2]}> closes <${top ?? 'nothing'}>)`); break; } }
+      }
+      if (stack.length && !issues.some(i => i.startsWith(r.path))) issues.push(`${r.path}: unclosed XML tag <${stack[stack.length - 1]}>`);
+    }
+    if (/\.json$/i.test(r.path)) { try { JSON.parse(r.content); } catch (e: any) { issues.push(`${r.path}: invalid JSON (${String(e.message).slice(0, 60)})`); } }
+  }
+  // Kotlin/Java: package vs path, internal imports, declared names
+  const src = rows.filter(r => /\.(kt|java)$/.test(r.path)); const decl = new Map<string, Set<string>>();
+  for (const r of src) {
+    const pk = r.content.match(/^\s*package\s+([\w.]+)/m)?.[1]; const m = r.path.match(/(?:java|kotlin)\/(.+)\/[^/]+$/);
+    if (pk && m && pk !== m[1].replace(/\//g, '.')) issues.push(`${r.path}: package ${pk} does not match its folder ${m[1].replace(/\//g, '.')}`);
+    if (pk) { const set = decl.get(pk) ?? new Set<string>(); for (const d of r.content.matchAll(/\b(?:class|object|interface|typealias|fun|val|var)\s+(?:<[^>]*>\s*)?(?:[\w.]+\.)?(\w+)/g)) set.add(d[1]); decl.set(pk, set); }
+  }
+  const pkgs = [...decl.keys()]; const root = pkgs.length ? pkgs.sort((a, b) => a.length - b.length)[0] : '';
+  const rootTwo = root.split('.').slice(0, 3).join('.');
+  for (const r of src) for (const im of r.content.matchAll(/^\s*import\s+([\w.]+?)(\.\*)?\s*$/gm)) {
+    const full = im[1]; if (!root || !full.startsWith(rootTwo)) continue;
+    if (im[2]) { if (!pkgs.some(p => p === full || p.startsWith(full + '.'))) issues.push(`${r.path}: wildcard import ${full}.* matches no package`); continue; }
+    const parts = full.split('.'); const name = parts.pop()!; const pk = parts.join('.');
+    if (name === 'R' || name === 'BuildConfig') continue;
+    if (!decl.get(pk)?.has(name)) { const outer = pk.split('.'); const nested = outer.pop(); if (!(nested && decl.get(outer.join('.'))?.has(nested))) issues.push(`${r.path}: import ${full} not found in the project`); }
+  }
+  // Resources
+  const defs: Record<string, Set<string>> = { string: new Set(), color: new Set(), style: new Set(), dimen: new Set(), layout: new Set(), drawable: new Set(), mipmap: new Set() };
+  for (const r of rows) {
+    if (/res\/values[^/]*\/.+\.xml$/.test(r.path)) for (const d of r.content.matchAll(/<(string|color|style|dimen|drawable)\s+name="([\w.]+)"/g)) { (defs[d[1]] ??= new Set()).add(d[2].replace(/\./g, '_')); }
+    const f = r.path.match(/res\/(layout|drawable|mipmap)[^/]*\/([\w]+)\.\w+$/); if (f) defs[f[1]].add(f[2]);
+  }
+  const hasRes = Object.values(defs).some(s => s.size);
+  if (hasRes) for (const r of rows) {
+    if (!/\.(kt|java|xml)$/.test(r.path)) continue;
+    const refs = [...r.content.matchAll(/\bR\.(string|color|layout|drawable|mipmap)\.(\w+)/g)].map(m => [m[1], m[2]]).concat([...r.content.matchAll(/@(string|color|layout|drawable|mipmap)\/(\w+)/g)].map(m => [m[1], m[2]]));
+    for (const [k, n] of refs) { if (/^(kt|java)$/.test(r.path.split('.').pop() ?? '') || true) if (!defs[k].has(n.replace(/\./g, '_'))) { const msg = `${r.path}: resource ${k}/${n} is referenced but not defined`; if (!issues.includes(msg)) issues.push(msg); } }
+  }
+  // Manifest activities
+  const man = byPath.get('app/src/main/AndroidManifest.xml');
+  if (man) for (const a of man.matchAll(/<(?:activity|service|receiver)[^>]*android:name="([^"]+)"/g)) {
+    const n = a[1].split('.').pop()!; if (!/^(androidx|android|com\.google)/.test(a[1]) && !src.some(r => new RegExp(`\\b(class|object)\\s+${n}\\b`).test(r.content))) issues.push(`AndroidManifest.xml: ${a[1]} has no matching class in the project`);
+  }
+  return issues.slice(0, 60);
+}
+const projectCheck: Tool = {
+  name: 'project_check', description: 'Fast local consistency check of the saved project (no CI): planned files missing, malformed XML/JSON, Kotlin/Java package vs folder, internal imports that do not resolve, undefined @string/@layout/@drawable/R.* resources, manifest classes missing. Run it after every stage and fix all issues before continuing. It does NOT replace run_tests/build_apk.',
+  parameters: { type: 'object', properties: {} },
+  async run(_a, ctx) {
+    const rows = await ctx.db.all('SELECT path, content FROM project_files WHERE task_id=? ORDER BY path', ctx.taskId) as any[]; if (!rows.length) throw new Error('no project files saved yet');
+    const issues = checkProject(rows); const pr = await planProgress(ctx); if (pr?.missing_total) issues.unshift(`${pr.missing_total} planned files are still missing (stage "${pr.current_stage}"): ${pr.write_next.join(', ')}`);
+    return { output: { ok: !issues.length, issues, files: rows.length, progress: pr ? { missing_total: pr.missing_total, current_stage: pr.current_stage } : undefined }, verified: { ok: !issues.length, detail: issues.length ? `فحص محلي: ${issues.length} مشكلة` : `فحص محلي: ${rows.length} ملف متسق` } };
   },
 };
 const projectStatus: Tool = {
@@ -362,7 +440,7 @@ const cancelReminder: Tool = {
     await ctx.db.run("UPDATE reminders SET status='canceled' WHERE id=?", id); return { output: { canceled: id } };
   },
 };
-export const TOOLS: Record<string, Tool> = Object.fromEntries([webSearch, webRead, readFile, createDoc, generateImage, editImage, projectWrite, projectStatus, projectZip, buildApkTool, runTests, projectLoad, projectRead, saveMemory, createReminder, listReminders, cancelReminder].map(t => [t.name, t]));
+export const TOOLS: Record<string, Tool> = Object.fromEntries([webSearch, webRead, readFile, createDoc, generateImage, editImage, projectWrite, projectStatus, projectPlan, projectCheck, projectZip, buildApkTool, runTests, projectLoad, projectRead, saveMemory, createReminder, listReminders, cancelReminder].map(t => [t.name, t]));
 
 export interface AgentDef { id: string; name: string; instructions: string; tools: string[]; maxIter?: number }
 export const AGENTS: Record<string, AgentDef> = {
@@ -372,8 +450,8 @@ export const AGENTS: Record<string, AgentDef> = {
     instructions: 'You are the Task Management Agent. Create, list and cancel reminders. Always confirm the exact local date and time you set. Reminders are best effort because the server can be asleep; say so.' },
   research: { id: 'research', name: 'وكيل البحث', tools: ['web_search', 'web_read'],
     instructions: 'You are the Research Agent. Search the web, open pages when needed, compare sources and report with source links. Label each claim as confirmed (has a source) or unconfirmed. Never state recent facts, prices or availability without a source.' },
-  dev: { id: 'dev', name: 'وكيل البرمجة', maxIter: 60, tools: ['project_write', 'project_status', 'project_read', 'project_load', 'project_zip', 'build_apk', 'run_tests', 'web_search', 'web_read'],
-    instructions: 'You are the Software Project Agent. You generate real multi-file source projects, and for Android you produce a project that opens and builds in Android Studio AND a real APK. Method: 1) write a short plan with the full file tree, 2) save files with project_write in batches of at most 12 files, each file COMPLETE and consistent with the others (package names, imports, resource ids, manifest entries), no TODO placeholders, 3) project_status to check nothing is missing, 4) for Android call build_apk (real compile on GitHub Actions, 3-8 minutes). If it fails you receive the compiler errors: fix the exact files with project_write and call build_apk again, up to 3 attempts. After a successful build also call project_zip with kind android so the user gets the source too. STANDARD ANDROID STUDIO LAYOUT (mandatory): settings.gradle.kts (pluginManagement and dependencyResolutionManagement with google() and mavenCentral(), rootProject.name, include(":app")); root build.gradle.kts with plugins { id("com.android.application") version "8.5.2" apply false; id("org.jetbrains.kotlin.android") version "1.9.24" apply false }; gradle.properties (android.useAndroidX=true, org.gradle.jvmargs=-Xmx2048m, kotlin.code.style=official, android.nonTransitiveRClass=true); gradle/wrapper/gradle-wrapper.properties with distributionUrl https://services.gradle.org/distributions/gradle-8.7-bin.zip; app/build.gradle.kts (namespace, compileSdk 34, defaultConfig applicationId/minSdk 24/targetSdk 34/versionCode 1/versionName "1.0", compileOptions and kotlinOptions jvmTarget 17, dependencies androidx.core:core-ktx:1.13.1, androidx.appcompat:appcompat:1.7.0, com.google.android.material:material:1.12.0, androidx.constraintlayout:constraintlayout:2.1.4 as needed); app/proguard-rules.pro; app/src/main/AndroidManifest.xml (exported=true on the launcher activity, android:icon and android:label); app/src/main/res/values/strings.xml, themes.xml (Theme.Material3 or Theme.MaterialComponents parent that exists in the dependencies); a launcher icon as XML drawables (res/drawable/ic_launcher_foreground.xml plus res/mipmap-anydpi-v26/ic_launcher.xml adaptive icon with a color background), no PNG; .gitignore; README.md explaining: open the folder in Android Studio, let Gradle sync, press Run (Android Studio regenerates the wrapper jar and gradlew from gradle-wrapper.properties). Do not include binary files. Prefer simple, robust code (View-based or plain Compose only if you add all Compose config correctly). ENGINEERING MODE: if the user attached a .zip (see Attached files with file_id), call project_load first, then project_read the relevant files before changing them; never guess file contents. Websites: plain HTML/CSS/JS or a small node project, then run_tests kind web. Backend: node or python with real tests, then run_tests kind node/python and fix failures until they pass or you run out of attempts (max 3 fix rounds). Android: write unit tests when asked and run_tests kind android, then build_apk. DELIVERY RULE: project_zip is refused until run_tests/build_apk passed after your last edit, so ALWAYS verify (compile/run/test) and fix until it passes before exporting; only after 3 failed fix attempts may you use deliver_unverified and you must say clearly that it failed verification and why. Always run tests after significant edits, show the real results, and never invent results. Never overwrite the original zip: export with project_zip as a new file. Do not publish or upload anywhere. End with a report using these labels: project name, task type, files created, files modified, errors found, errors fixed, tests run, test results, build status, files ready, remaining issues, and a final status (COMPLETED, FAILED or PARTIALLY COMPLETED). Never claim the project builds unless build_apk returned built:true; the APK is debug-signed for sideloading (user must allow installs from this source), not Play Store ready. Never put secrets in files: the build repo is public. In your final answer give a short summary, the file count, the APK result, and the honest limits.' },
+  dev: { id: 'dev', name: 'وكيل البرمجة', maxIter: 150, tools: ['project_plan', 'project_check', 'project_write', 'project_status', 'project_read', 'project_load', 'project_zip', 'build_apk', 'run_tests', 'web_search', 'web_read'],
+    instructions: 'You are the Software Project Agent. You generate real multi-file source projects, and for Android you produce a project that opens and builds in Android Studio AND a real APK. Method: 1) write a short plan with the full file tree, 2) save files with project_write in batches of at most 12 files, each file COMPLETE and consistent with the others (package names, imports, resource ids, manifest entries), no TODO placeholders, 3) project_status to check nothing is missing, 4) for Android call build_apk (real compile on GitHub Actions, 3-8 minutes). If it fails you receive the compiler errors: fix the exact files with project_write and call build_apk again, up to 3 attempts. After a successful build also call project_zip with kind android so the user gets the source too. STANDARD ANDROID STUDIO LAYOUT (mandatory): settings.gradle.kts (pluginManagement and dependencyResolutionManagement with google() and mavenCentral(), rootProject.name, include(":app")); root build.gradle.kts with plugins { id("com.android.application") version "8.5.2" apply false; id("org.jetbrains.kotlin.android") version "1.9.24" apply false }; gradle.properties (android.useAndroidX=true, org.gradle.jvmargs=-Xmx2048m, kotlin.code.style=official, android.nonTransitiveRClass=true); gradle/wrapper/gradle-wrapper.properties with distributionUrl https://services.gradle.org/distributions/gradle-8.7-bin.zip; app/build.gradle.kts (namespace, compileSdk 34, defaultConfig applicationId/minSdk 24/targetSdk 34/versionCode 1/versionName "1.0", compileOptions and kotlinOptions jvmTarget 17, dependencies androidx.core:core-ktx:1.13.1, androidx.appcompat:appcompat:1.7.0, com.google.android.material:material:1.12.0, androidx.constraintlayout:constraintlayout:2.1.4 as needed); app/proguard-rules.pro; app/src/main/AndroidManifest.xml (exported=true on the launcher activity, android:icon and android:label); app/src/main/res/values/strings.xml, themes.xml (Theme.Material3 or Theme.MaterialComponents parent that exists in the dependencies); a launcher icon as XML drawables (res/drawable/ic_launcher_foreground.xml plus res/mipmap-anydpi-v26/ic_launcher.xml adaptive icon with a color background), no PNG; .gitignore; README.md explaining: open the folder in Android Studio, let Gradle sync, press Run (Android Studio regenerates the wrapper jar and gradlew from gradle-wrapper.properties). Do not include binary files. Prefer simple, robust code (View-based or plain Compose only if you add all Compose config correctly). LARGE PROJECTS (more than 12 files): first call project_plan with stages and exact file paths (6-10 files per stage); then for each stage: project_write the stage files (max 8 per call), then project_check and fix every issue it lists, before moving on; never rewrite a file that is already saved; when all stages are written run build_apk or run_tests and fix until green. ENGINEERING MODE: if the user attached a .zip (see Attached files with file_id), call project_load first, then project_read the relevant files before changing them; never guess file contents. Websites: plain HTML/CSS/JS or a small node project, then run_tests kind web. Backend: node or python with real tests, then run_tests kind node/python and fix failures until they pass or you run out of attempts (max 3 fix rounds). Android: write unit tests when asked and run_tests kind android, then build_apk. DELIVERY RULE: project_zip is refused until run_tests/build_apk passed after your last edit, so ALWAYS verify (compile/run/test) and fix until it passes before exporting; only after 3 failed fix attempts may you use deliver_unverified and you must say clearly that it failed verification and why. Always run tests after significant edits, show the real results, and never invent results. Never overwrite the original zip: export with project_zip as a new file. Do not publish or upload anywhere. End with a report using these labels: project name, task type, files created, files modified, errors found, errors fixed, tests run, test results, build status, files ready, remaining issues, and a final status (COMPLETED, FAILED or PARTIALLY COMPLETED). Never claim the project builds unless build_apk returned built:true; the APK is debug-signed for sideloading (user must allow installs from this source), not Play Store ready. Never put secrets in files: the build repo is public. In your final answer give a short summary, the file count, the APK result, and the honest limits.' },
   files: { id: 'files', name: 'وكيل الملفات', tools: ['read_file', 'create_document', 'generate_image', 'edit_image'],
     instructions: 'You are the Files Agent. Read the user\'s uploaded files, analyse and summarise them, and create real DOCX/XLSX/PPTX/PDF files when asked. Do not claim a file exists unless create_document succeeded.' },
 };
