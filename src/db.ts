@@ -28,6 +28,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS tg_links(chat_id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, tg_user_id TEXT, agent TEXT, created_at BIGINT)`,
   `CREATE TABLE IF NOT EXISTS tg_seen(update_id BIGINT PRIMARY KEY, at BIGINT)`,
   `CREATE TABLE IF NOT EXISTS tg_approvals(token TEXT PRIMARY KEY, task_id TEXT, call_id TEXT, chat_id TEXT, user_id TEXT)`,
+  `CREATE TABLE IF NOT EXISTS project_plan(task_id TEXT PRIMARY KEY, plan TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS project_files(task_id TEXT NOT NULL, path TEXT NOT NULL, content TEXT NOT NULL, PRIMARY KEY(task_id, path))`,
   `CREATE TABLE IF NOT EXISTS plan_limits(plan TEXT PRIMARY KEY, daily_messages INTEGER)`,
 ];
