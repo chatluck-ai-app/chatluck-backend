@@ -6,7 +6,7 @@ export const MIME: Record<string, string> = {
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  pdf: 'application/pdf', txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', json: 'application/json',
+  pdf: 'application/pdf', zip: 'application/zip', txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', json: 'application/json',
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
 };
 export const extOf = (name: string) => (name.split('.').pop() ?? '').toLowerCase();
@@ -14,6 +14,7 @@ export const isImage = (name: string) => ['png', 'jpg', 'jpeg', 'webp'].includes
 
 export async function extractText(name: string, buf: Buffer): Promise<string> {
   const ext = extOf(name); let text = '';
+  if (ext === 'zip') { const JSZip: any = (await import('jszip')).default; const z = await JSZip.loadAsync(buf); return Object.keys(z.files).filter(n => !z.files[n].dir).join('\n'); }
   if (ext === 'pdf') {
     const { getDocumentProxy, extractText: ex } = await import('unpdf');
     const pdf = await getDocumentProxy(new Uint8Array(buf));
