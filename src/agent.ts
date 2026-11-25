@@ -89,7 +89,7 @@ export async function runTask(db: Db, provider: Provider, taskId: string, emit: 
       st.iter++;
       if (!provider.chat) throw new Error('provider has no tool-calling support');
       let resp: Awaited<ReturnType<NonNullable<Provider['chat']>>> | undefined, err: any;
-      for (let a = 0; a < 2 && !resp; a++) { try { resp = await provider.chat(ctx.model, st.messages, specs, signal); } catch (e: any) { err = e; if (!transient(String(e?.status ?? e?.message)) || a) break; await sleep(opts.retryDelayMs ?? (e?.status === 429 ? 20000 : 1000)); } }
+      for (let a = 0; a < 5 && !resp; a++) { try { resp = await provider.chat(ctx.model, st.messages, specs, signal); } catch (e: any) { err = e; const busy = e?.status === 429 || e?.status === 503 || /UNAVAILABLE|high demand/i.test(String(e?.message)); if (!transient(String(e?.status ?? e?.message)) && !busy) break; if (a >= (busy ? 4 : 1)) break; await sleep(opts.retryDelayMs ?? (busy ? 6000 * (a + 1) : 1000)); } }
       if (!resp) throw err;
       if (resp.toolCalls.length) {
         st.messages.push({ role: 'assistant', content: resp.content || null, tool_calls: resp.toolCalls.map(c => ({ id: c.id, type: 'function' as const, function: { name: c.name, arguments: c.arguments }, ...(c.extra ? { extra_content: c.extra } : {}) })) });
