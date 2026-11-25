@@ -33,12 +33,36 @@ const webSearch: Tool = {
   name: 'web_search', description: 'Search the web (Google Search grounding). Returns an answer with source links. Use for anything recent or factual; always cite the sources.',
   parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
   async run({ query }, ctx) {
-    if (!ctx.provider.search) throw new Error('web search is not available on this provider');
-    const r = await ctx.provider.search(String(query).slice(0, 400), ctx.signal);
-    if (!r.sources.length) return { output: { answer: r.answer, sources: [], note: 'No sources were returned; treat this as UNCONFIRMED.' } };
-    return { output: r };
+    const q = String(query).slice(0, 400);
+    if (ctx.provider.search) {
+      try {
+        const r = await ctx.provider.search(q, ctx.signal);
+        if (!r.sources.length) return { output: { answer: r.answer, sources: [], note: 'No sources were returned; treat this as UNCONFIRMED.' } };
+        return { output: r };
+      } catch { /* quota or unsupported: fall back to plain web search below */ }
+    }
+    const res = await bingSearch(q, ctx.fetchImpl ?? fetch, ctx.signal);
+    if (!res.length) throw new Error('web search returned no results');
+    return { output: { note: 'Plain web search results (no AI grounding). Open a result with web_read before stating facts; unverified snippets are UNCONFIRMED.', results: res } };
   },
 };
+export async function bingSearch(q: string, f: typeof fetch, signal: AbortSignal) {
+  const r = await f('https://www.bing.com/search?setlang=en&q=' + encodeURIComponent(q), { signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
+    headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36', 'accept-language': 'en-US,en;q=0.9' } });
+  if (!r.ok) throw new Error('search HTTP ' + r.status);
+  const html = await r.text(); const out: { title: string; url: string; snippet: string }[] = [];
+  for (const blk of html.split('<li class="b_algo"').slice(1)) {
+    const m = blk.match(/<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/); if (!m) continue;
+    let url = m[1].replace(/&amp;/g, '&');
+    const u = url.match(/[?&]u=a1([A-Za-z0-9_-]+)/);
+    if (u) { try { url = Buffer.from(u[1], 'base64url').toString('utf8'); } catch { continue; } }
+    if (!/^https?:\/\//.test(url) || /bing\.com\/ck\//.test(url)) continue;
+    const sn = blk.match(/<p[^>]*>([\s\S]*?)<\/p>/);
+    out.push({ title: htmlToText(m[2]).slice(0, 160), url, snippet: sn ? htmlToText(sn[1]).slice(0, 300) : '' });
+    if (out.length >= 6) break;
+  }
+  return out;
+}
 const webRead: Tool = {
   name: 'web_read', description: 'Open a public web page by URL and return its readable text (first 12000 chars).',
   parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
