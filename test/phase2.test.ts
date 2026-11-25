@@ -134,11 +134,22 @@ test('dev agent: writes many files in batches, zips, zip is re-opened and valid;
     () => ({ toolCalls: [call('project_write', { files: [{ path: '../evil.txt', content: 'x' }] })] }),
     () => ({ toolCalls: [call('project_write', { files: [...core, ...mk(8, 0)] }, 'w1')] }),
     () => ({ toolCalls: [call('project_write', { files: mk(12, 100) }, 'w2')] }),
+    () => ({ toolCalls: [call('project_zip', { name: 'Early', kind: 'android' }, 'z0')] }),
+    () => ({ toolCalls: [call('run_tests', { kind: 'custom', command: 'true' }, 'rt')] }),
     (m: ChatMsg[]) => { const asst = m.filter(x => x.role === 'assistant') as any[]; assert.ok(!JSON.stringify(asst).includes('class F100'), 'old file bodies are compacted out of the context'); return { toolCalls: [call('project_zip', { name: 'App', kind: 'android' })] }; },
     () => ({ content: 'done' }),
   ];
+  process.env.GITHUB_TOKEN = 'T'; process.env.GITHUB_BUILD_REPO = 'o/r'; const realFetch = globalThis.fetch;
+  const J = (o: any) => new Response(JSON.stringify(o), { status: 200 });
+  globalThis.fetch = (async (url: any, init: any = {}) => { const u = String(url);
+    if (u.endsWith('/git/trees')) return J({ sha: 't' }); if (u.endsWith('/git/commits')) return J({ sha: 'c' }); if (u.endsWith('/git/refs')) return J({});
+    if (u.includes('/actions/runs?')) return J({ workflow_runs: [{ id: 1, status: 'completed', conclusion: 'success', html_url: 'http://run' }] });
+    if (u.endsWith('/jobs')) return J({ jobs: [{ id: 5, conclusion: 'success' }] }); if (u.endsWith('/logs')) return new Response('ok tests 1 passed');
+    if ((init.method ?? 'GET') === 'DELETE') return new Response(null, { status: 204 }); return realFetch(url, init); }) as any;
   const { app, token } = await setup(script);
   const { evs } = await run(app, token, { goal: 'generate android studio project', agent: 'dev' });
+  globalThis.fetch = realFetch;
+  assert.ok(evs.some(e => e.ev === 'step' && e.data.tool === 'project_zip' && e.data.status === 'failed'), 'zip refused before verification');
   assert.equal(evs.at(-1)!.data.status, 'completed');
   const f = evs.find(e => e.ev === 'file')!.data; assert.equal(f.name, 'App.zip');
   const dl = await app.inject({ method: 'GET', url: '/v1/files/' + f.fileId + '/download', headers: H(token) });
