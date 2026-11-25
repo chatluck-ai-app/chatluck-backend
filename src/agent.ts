@@ -68,6 +68,7 @@ export async function runTask(db: Db, provider: Provider, taskId: string, emit: 
           catch (e: any) { lastErr = String(e?.message ?? e).slice(0, 300); if (!transient(lastErr) || attempt) break; await sleep(opts.retryDelayMs ?? 1000); }
         }
         if (ok) {
+          if (tool.compactArgs) for (const m of st.messages) if (m.role === 'assistant' && m.tool_calls) for (const tc of m.tool_calls) if (tc.id === call.id) tc.function.arguments = JSON.stringify(tool.compactArgs(args));
           const idx = await addStep(db, taskId, 'tool', call.name, args, out, 'ok'); recovered.add(call.name);
           emit('step', { idx, kind: 'tool', tool: call.name, status: 'ok', preview: preview(out) });
           if (verified) { const vi = await addStep(db, taskId, 'verify', call.name, { fileId }, verified, verified.ok ? 'ok' : 'failed'); emit('step', { idx: vi, kind: 'verify', tool: call.name, status: verified.ok ? 'ok' : 'failed', preview: verified.detail }); }
@@ -83,11 +84,11 @@ export async function runTask(db: Db, provider: Provider, taskId: string, emit: 
       }
       // 2. ask the model
       if (await cancelled()) { await setStatus(db, taskId, 'canceled', { state: st }); emit('done', { taskId, status: 'canceled' }); return; }
-      if (st.iter >= MAX_ITER) throw new Error('تجاوزت المهمة الحد الأقصى لعدد الخطوات (' + MAX_ITER + ').');
+      const cap = agent.maxIter ?? MAX_ITER; if (st.iter >= cap) throw new Error('تجاوزت المهمة الحد الأقصى لعدد الخطوات (' + cap + ').');
       st.iter++;
       if (!provider.chat) throw new Error('provider has no tool-calling support');
       let resp: Awaited<ReturnType<NonNullable<Provider['chat']>>> | undefined, err: any;
-      for (let a = 0; a < 2 && !resp; a++) { try { resp = await provider.chat(ctx.model, st.messages, specs, signal); } catch (e: any) { err = e; if (!transient(String(e?.status ?? e?.message)) || a) break; await sleep(opts.retryDelayMs ?? 1000); } }
+      for (let a = 0; a < 2 && !resp; a++) { try { resp = await provider.chat(ctx.model, st.messages, specs, signal); } catch (e: any) { err = e; if (!transient(String(e?.status ?? e?.message)) || a) break; await sleep(opts.retryDelayMs ?? (e?.status === 429 ? 20000 : 1000)); } }
       if (!resp) throw err;
       if (resp.toolCalls.length) {
         st.messages.push({ role: 'assistant', content: resp.content || null, tool_calls: resp.toolCalls.map(c => ({ id: c.id, type: 'function' as const, function: { name: c.name, arguments: c.arguments }, ...(c.extra ? { extra_content: c.extra } : {}) })) });
