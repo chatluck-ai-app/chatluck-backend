@@ -146,3 +146,18 @@ test('dev agent: writes many files in batches, zips, zip is re-opened and valid;
   assert.equal(Object.keys(z.files).filter((n: string) => !z.files[n].dir).length, 4 + 11 + 12);
   assert.ok((await z.file('app/src/main/java/com/x/F105.kt').async('string')).includes('class F105'));
 });
+
+test('edit_image: real sharp processing is applied and verified (resize, enhance, format)', async () => {
+  const sharp: any = (await import('sharp')).default;
+  const png: Buffer = await sharp({ create: { width: 200, height: 100, channels: 3, background: { r: 120, g: 60, b: 30 } } }).png().toBuffer();
+  const { app, token } = await setup([
+    (m: ChatMsg[]) => { const fid = /file_id: ([\w-]+)/.exec(JSON.stringify(m))![1]; return { toolCalls: [call('edit_image', { file_id: fid, ops: [{ op: 'upscale', factor: 2 }, { op: 'enhance' }, { op: 'format', type: 'jpeg' }] })] }; },
+    () => ({ content: 'ok' })]);
+  const up = await app.inject({ method: 'POST', url: '/v1/files', headers: H(token), payload: { name: 'pic.png', dataBase64: png.toString('base64') } });
+  const fileId = up.json().file?.id ?? up.json().id;
+  const { evs } = await run(app, token, { goal: 'enhance it', agent: 'files', fileIds: [fileId] });
+  assert.equal(evs.at(-1)!.data.status, 'completed');
+  const f = evs.find(e => e.ev === 'file')!.data; assert.ok(f.name.endsWith('_edited.jpg'));
+  const dl = await app.inject({ method: 'GET', url: '/v1/files/' + f.fileId + '/download', headers: H(token) });
+  const meta = await sharp(dl.rawPayload).metadata(); assert.equal(meta.width, 400); assert.equal(meta.format, 'jpeg');
+});
