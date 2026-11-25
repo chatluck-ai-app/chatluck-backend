@@ -7,7 +7,7 @@ import { addMemory, MemoryError } from '../memory.ts';
 import { createDocument, verifyDocument, extractText, isImage, extOf, MIME, type DocSpec } from '../files.ts';
 
 export interface ToolCtx { db: Db; userId: string; taskId: string; provider: Provider; model: string; signal: AbortSignal; fetchImpl?: typeof fetch }
-export interface Tool extends ToolSpec { needsApproval?: boolean; run(args: any, ctx: ToolCtx): Promise<{ output: any; verified?: { ok: boolean; detail: string }; fileId?: string }> }
+export interface Tool extends ToolSpec { needsApproval?: boolean; compactArgs?(args: any): any; run(args: any, ctx: ToolCtx): Promise<{ output: any; verified?: { ok: boolean; detail: string }; fileId?: string }> }
 
 /** Blocks private/loopback/link-local targets (SSRF). */
 export function isPrivateIp(ip: string) {
@@ -115,6 +115,59 @@ const createDoc: Tool = {
     return { output: { file_id: id, name: doc.name, size: doc.buf.length }, verified, fileId: id };
   },
 };
+
+const SAFE_PATH = (p: string) => typeof p === 'string' && p.length > 0 && p.length <= 200 && !p.startsWith('/') && !p.includes('\\') && !p.split('/').some(x => x === '..' || x === '' || x === '.') && !/[\x00-\x1f]/.test(p);
+const projectWrite: Tool = {
+  name: 'project_write', description: 'Save source files into the project being generated (accumulates across calls; same path overwrites). Max 15 files and 60000 chars per file per call. Write COMPLETE files, no placeholders. Paths are relative like app/src/main/AndroidManifest.xml.',
+  parameters: { type: 'object', properties: { files: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } }, required: ['files'] },
+  compactArgs: (a) => ({ files: (a?.files ?? []).map((f: any) => ({ path: f?.path, content: '[saved]' })) }),
+  async run({ files }, ctx) {
+    if (!Array.isArray(files) || !files.length || files.length > 15) throw new Error('send 1 to 15 files per call');
+    const tot: any = await ctx.db.get('SELECT count(*) c, COALESCE(sum(length(content)),0) b FROM project_files WHERE task_id=?', ctx.taskId);
+    let added = 0;
+    for (const f of files) {
+      if (!SAFE_PATH(f?.path)) throw new Error('invalid path: ' + String(f?.path).slice(0, 80));
+      if (typeof f.content !== 'string' || f.content.length > 60000) throw new Error('bad or too large content for ' + f.path);
+      added += f.content.length;
+    }
+    if (Number(tot.c) + files.length > 1000 || Number(tot.b) + added > 6_000_000) throw new Error('project size limit reached (1000 files / 6 MB)');
+    for (const f of files) { await ctx.db.run('DELETE FROM project_files WHERE task_id=? AND path=?', ctx.taskId, f.path); await ctx.db.run('INSERT INTO project_files(task_id,path,content) VALUES(?,?,?)', ctx.taskId, f.path, f.content); }
+    const n: any = await ctx.db.get('SELECT count(*) c FROM project_files WHERE task_id=?', ctx.taskId);
+    return { output: { saved: files.length, total_files: Number(n.c) } };
+  },
+};
+const projectStatus: Tool = {
+  name: 'project_status', description: 'List the file paths saved so far in the project.', parameters: { type: 'object', properties: {} },
+  async run(_a, ctx) {
+    const rows = await ctx.db.all('SELECT path, length(content) len FROM project_files WHERE task_id=? ORDER BY path', ctx.taskId) as any[];
+    return { output: { total_files: rows.length, files: rows.slice(0, 400).map(r => r.path + ' (' + r.len + ')') } };
+  },
+};
+const ANDROID_REQUIRED: [string, RegExp][] = [['settings.gradle(.kts)', /^settings\.gradle(\.kts)?$/], ['root build.gradle(.kts)', /^build\.gradle(\.kts)?$/], ['app/build.gradle(.kts)', /^app\/build\.gradle(\.kts)?$/], ['app/src/main/AndroidManifest.xml', /^app\/src\/main\/AndroidManifest\.xml$/], ['a .kt or .java source file', /\.(kt|java)$/]];
+const projectZip: Tool = {
+  name: 'project_zip', description: 'Package all saved project files into a downloadable .zip and verify it by re-opening it. Use kind "android" for an Android Studio project (checks the required Gradle/manifest/source files).',
+  parameters: { type: 'object', properties: { name: { type: 'string', description: 'zip file name, e.g. MyApp.zip' }, kind: { type: 'string', enum: ['android', 'generic'] } }, required: ['name'] },
+  async run({ name, kind }, ctx) {
+    const rows = await ctx.db.all('SELECT path, content FROM project_files WHERE task_id=? ORDER BY path', ctx.taskId) as any[];
+    if (!rows.length) throw new Error('no project files saved yet');
+    if (kind === 'android') {
+      const missing = ANDROID_REQUIRED.filter(([, re]) => !rows.some(r => re.test(r.path))).map(([n]) => n);
+      if (missing.length) throw new Error('Android project is missing: ' + missing.join(', '));
+    }
+    const JSZip: any = (await import('jszip')).default; const z = new JSZip();
+    for (const r of rows) z.file(r.path, r.content);
+    const buf: Buffer = await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const back = await JSZip.loadAsync(buf); const names = Object.keys(back.files).filter((n: string) => !back.files[n].dir);
+    let same = names.length === rows.length;
+    for (const r of rows) { const f = back.file(r.path); if (!f || (await f.async('string')) !== r.content) { same = false; break; } }
+    if (!same) throw new Error('zip verification failed (file count or content mismatch)');
+    const fname = String(name || 'project.zip').replace(/[^\w.\-]/g, '_').replace(/(\.zip)?$/i, '.zip').slice(0, 80);
+    if (buf.length > 20 * 1024 * 1024) throw new Error('zip is larger than 20 MB');
+    const id = randomUUID();
+    await ctx.db.run('INSERT INTO files(id,user_id,name,mime,size,origin,text,data,task_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', id, ctx.userId, fname, 'application/zip', buf.length, 'generated', null, buf.toString('base64'), ctx.taskId, Date.now());
+    return { output: { file_id: id, name: fname, size: buf.length, files: rows.length }, verified: { ok: true, detail: `أعيد فتح الملف المضغوط: ${rows.length} ملف مطابقة للمحتوى` + (kind === 'android' ? ' وهيكل Android الأساسي موجود' : '') }, fileId: id };
+  },
+};
 const saveMemory: Tool = {
   name: 'save_memory', needsApproval: true, description: 'Save a short preference or fact the user asked you to remember. Never passwords, card numbers or secrets. Requires the user to approve.',
   parameters: { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] },
@@ -154,9 +207,9 @@ const cancelReminder: Tool = {
     await ctx.db.run("UPDATE reminders SET status='canceled' WHERE id=?", id); return { output: { canceled: id } };
   },
 };
-export const TOOLS: Record<string, Tool> = Object.fromEntries([webSearch, webRead, readFile, createDoc, saveMemory, createReminder, listReminders, cancelReminder].map(t => [t.name, t]));
+export const TOOLS: Record<string, Tool> = Object.fromEntries([webSearch, webRead, readFile, createDoc, projectWrite, projectStatus, projectZip, saveMemory, createReminder, listReminders, cancelReminder].map(t => [t.name, t]));
 
-export interface AgentDef { id: string; name: string; instructions: string; tools: string[] }
+export interface AgentDef { id: string; name: string; instructions: string; tools: string[]; maxIter?: number }
 export const AGENTS: Record<string, AgentDef> = {
   general: { id: 'general', name: 'المساعد الرئيسي', tools: ['web_search', 'web_read', 'read_file', 'create_document', 'save_memory', 'create_reminder', 'list_reminders', 'cancel_reminder'],
     instructions: 'You are Chat Luck, the lead assistant. Pick the right tool when a task needs real information, files or saved preferences; otherwise answer directly.' },
@@ -164,6 +217,8 @@ export const AGENTS: Record<string, AgentDef> = {
     instructions: 'You are the Task Management Agent. Create, list and cancel reminders. Always confirm the exact local date and time you set. Reminders are best effort because the server can be asleep; say so.' },
   research: { id: 'research', name: 'وكيل البحث', tools: ['web_search', 'web_read'],
     instructions: 'You are the Research Agent. Search the web, open pages when needed, compare sources and report with source links. Label each claim as confirmed (has a source) or unconfirmed. Never state recent facts, prices or availability without a source.' },
+  dev: { id: 'dev', name: 'وكيل البرمجة', maxIter: 60, tools: ['project_write', 'project_status', 'project_zip', 'web_search', 'web_read'],
+    instructions: 'You are the Software Project Agent. You generate real multi-file source projects (for example a full Android Studio project in Kotlin with Gradle Kotlin DSL) as a downloadable zip. Method: 1) write a short plan with the full file tree, 2) save files with project_write in batches of at most 12 files, each file COMPLETE and consistent with the others (package names, imports, resource ids, manifest entries), no TODO placeholders, 3) call project_status to check nothing is missing, 4) call project_zip (kind android for Android). Do not include binary files (gradle-wrapper.jar, images): include gradle/wrapper/gradle-wrapper.properties and a README that says to open the project in Android Studio and let it sync. You cannot compile or run the code here, so NEVER say it builds or works; say it was generated but not compiled or tested, and may need fixes. Do not put secrets or API keys in files. In your final answer give a short summary of the structure, the file count from the tool result, and the honest limits.' },
   files: { id: 'files', name: 'وكيل الملفات', tools: ['read_file', 'create_document'],
     instructions: 'You are the Files Agent. Read the user\'s uploaded files, analyse and summarise them, and create real DOCX/XLSX/PPTX/PDF files when asked. Do not claim a file exists unless create_document succeeded.' },
 };
