@@ -4,6 +4,7 @@ import { isIP } from 'node:net';
 import type { Db } from '../db.ts';
 import type { Provider, ToolSpec } from '../providers/types.ts';
 import { addMemory, MemoryError } from '../memory.ts';
+import { buildApk } from './apk.ts';
 import { createDocument, verifyDocument, extractText, isImage, extOf, MIME, type DocSpec } from '../files.ts';
 
 export interface ToolCtx { db: Db; userId: string; taskId: string; provider: Provider; model: string; signal: AbortSignal; fetchImpl?: typeof fetch }
@@ -143,7 +144,7 @@ const projectStatus: Tool = {
     return { output: { total_files: rows.length, files: rows.slice(0, 400).map(r => r.path + ' (' + r.len + ')') } };
   },
 };
-const ANDROID_REQUIRED: [string, RegExp][] = [['settings.gradle(.kts)', /^settings\.gradle(\.kts)?$/], ['root build.gradle(.kts)', /^build\.gradle(\.kts)?$/], ['app/build.gradle(.kts)', /^app\/build\.gradle(\.kts)?$/], ['app/src/main/AndroidManifest.xml', /^app\/src\/main\/AndroidManifest\.xml$/], ['a .kt or .java source file', /\.(kt|java)$/]];
+const ANDROID_REQUIRED: [string, RegExp][] = [['settings.gradle(.kts)', /^settings\.gradle(\.kts)?$/], ['gradle.properties', /^gradle\.properties$/], ['gradle/wrapper/gradle-wrapper.properties', /^gradle\/wrapper\/gradle-wrapper\.properties$/], ['app/src/main/res/values (strings or themes)', /^app\/src\/main\/res\/values\/.+\.xml$/], ['root build.gradle(.kts)', /^build\.gradle(\.kts)?$/], ['app/build.gradle(.kts)', /^app\/build\.gradle(\.kts)?$/], ['app/src/main/AndroidManifest.xml', /^app\/src\/main\/AndroidManifest\.xml$/], ['a .kt or .java source file', /\.(kt|java)$/]];
 const projectZip: Tool = {
   name: 'project_zip', description: 'Package all saved project files into a downloadable .zip and verify it by re-opening it. Use kind "android" for an Android Studio project (checks the required Gradle/manifest/source files).',
   parameters: { type: 'object', properties: { name: { type: 'string', description: 'zip file name, e.g. MyApp.zip' }, kind: { type: 'string', enum: ['android', 'generic'] } }, required: ['name'] },
@@ -174,6 +175,23 @@ async function saveGenerated(ctx: ToolCtx, name: string, mime: string, buf: Buff
   await ctx.db.run('INSERT INTO files(id,user_id,name,mime,size,origin,text,data,task_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', id, ctx.userId, name, mime, buf.length, 'generated', null, buf.toString('base64'), ctx.taskId, Date.now());
   return id;
 }
+const buildApkTool: Tool = {
+  name: 'build_apk', description: 'Compile the saved Android project for real on GitHub Actions (free) and return the debug APK file. Takes 3-8 minutes. If the build fails you get the compiler error lines: fix the files with project_write and call build_apk again (up to 3 attempts). The project must follow the standard Android Studio layout (Gradle 8.7, AGP 8.5.2, Kotlin 1.9.24, compileSdk 34). The build repo is public, so never include secrets.',
+  parameters: { type: 'object', properties: { name: { type: 'string', description: 'APK file name, e.g. MyApp.apk' } }, required: ['name'] },
+  async run({ name }, ctx) {
+    const token = process.env.GITHUB_TOKEN, repo = process.env.GITHUB_BUILD_REPO;
+    if (!token || !repo) throw new Error('بناء APK غير مفعّل على هذا الخادم (GITHUB_TOKEN/GITHUB_BUILD_REPO غير مضبوطين)');
+    const rows = await ctx.db.all('SELECT path, content FROM project_files WHERE task_id=? ORDER BY path', ctx.taskId) as any[];
+    if (!rows.length) throw new Error('no project files saved yet');
+    const missing = ANDROID_REQUIRED.filter(([, re]) => !rows.some(r => re.test(r.path))).map(([n]) => n);
+    if (missing.length) throw new Error('Android project is missing: ' + missing.join(', '));
+    const res = await buildApk({ token, repo, files: rows, fetchImpl: ctx.fetchImpl, signal: ctx.signal, id: ctx.taskId.replace(/[^\w]/g, '').slice(0, 12) + '-' + Date.now().toString(36) });
+    if (!res.ok) return { output: { built: false, note: res.note, errors: res.errorLines, run: res.runUrl }, verified: { ok: false, detail: 'فشل بناء APK: ' + (res.note ?? '') } };
+    const fname = String(name || res.apkName || 'app.apk').replace(/[^\w.\-]/g, '_').replace(/(\.apk)?$/i, '.apk').slice(0, 80);
+    const id = await saveGenerated(ctx, fname, 'application/vnd.android.package-archive', res.apk!);
+    return { output: { built: true, file_id: id, name: fname, size: res.apk!.length, run: res.runUrl, note: 'debug-signed APK for sideloading' }, verified: { ok: true, detail: `تم بناء APK فعليًا عبر GitHub Actions (${Math.round(res.apk!.length / 1024)} KB)` }, fileId: id };
+  },
+};
 const generateImage: Tool = {
   name: 'generate_image', description: 'Generate a new image from a text prompt (free services, no key: Pollinations, then Stable Horde). Write the prompt in English for best results (translate Arabic requests). Returns a file the user receives.',
   parameters: { type: 'object', properties: { prompt: { type: 'string' }, width: { type: 'integer' }, height: { type: 'integer' }, seed: { type: 'integer' } }, required: ['prompt'] },
@@ -289,7 +307,7 @@ const cancelReminder: Tool = {
     await ctx.db.run("UPDATE reminders SET status='canceled' WHERE id=?", id); return { output: { canceled: id } };
   },
 };
-export const TOOLS: Record<string, Tool> = Object.fromEntries([webSearch, webRead, readFile, createDoc, generateImage, editImage, projectWrite, projectStatus, projectZip, saveMemory, createReminder, listReminders, cancelReminder].map(t => [t.name, t]));
+export const TOOLS: Record<string, Tool> = Object.fromEntries([webSearch, webRead, readFile, createDoc, generateImage, editImage, projectWrite, projectStatus, projectZip, buildApkTool, saveMemory, createReminder, listReminders, cancelReminder].map(t => [t.name, t]));
 
 export interface AgentDef { id: string; name: string; instructions: string; tools: string[]; maxIter?: number }
 export const AGENTS: Record<string, AgentDef> = {
@@ -299,8 +317,8 @@ export const AGENTS: Record<string, AgentDef> = {
     instructions: 'You are the Task Management Agent. Create, list and cancel reminders. Always confirm the exact local date and time you set. Reminders are best effort because the server can be asleep; say so.' },
   research: { id: 'research', name: 'وكيل البحث', tools: ['web_search', 'web_read'],
     instructions: 'You are the Research Agent. Search the web, open pages when needed, compare sources and report with source links. Label each claim as confirmed (has a source) or unconfirmed. Never state recent facts, prices or availability without a source.' },
-  dev: { id: 'dev', name: 'وكيل البرمجة', maxIter: 60, tools: ['project_write', 'project_status', 'project_zip', 'web_search', 'web_read'],
-    instructions: 'You are the Software Project Agent. You generate real multi-file source projects (for example a full Android Studio project in Kotlin with Gradle Kotlin DSL) as a downloadable zip. Method: 1) write a short plan with the full file tree, 2) save files with project_write in batches of at most 12 files, each file COMPLETE and consistent with the others (package names, imports, resource ids, manifest entries), no TODO placeholders, 3) call project_status to check nothing is missing, 4) call project_zip (kind android for Android). Do not include binary files (gradle-wrapper.jar, images): include gradle/wrapper/gradle-wrapper.properties and a README that says to open the project in Android Studio and let it sync. You cannot compile or run the code here, so NEVER say it builds or works; say it was generated but not compiled or tested, and may need fixes. Do not put secrets or API keys in files. In your final answer give a short summary of the structure, the file count from the tool result, and the honest limits.' },
+  dev: { id: 'dev', name: 'وكيل البرمجة', maxIter: 60, tools: ['project_write', 'project_status', 'project_zip', 'build_apk', 'web_search', 'web_read'],
+    instructions: 'You are the Software Project Agent. You generate real multi-file source projects, and for Android you produce a project that opens and builds in Android Studio AND a real APK. Method: 1) write a short plan with the full file tree, 2) save files with project_write in batches of at most 12 files, each file COMPLETE and consistent with the others (package names, imports, resource ids, manifest entries), no TODO placeholders, 3) project_status to check nothing is missing, 4) for Android call build_apk (real compile on GitHub Actions, 3-8 minutes). If it fails you receive the compiler errors: fix the exact files with project_write and call build_apk again, up to 3 attempts. After a successful build also call project_zip with kind android so the user gets the source too. STANDARD ANDROID STUDIO LAYOUT (mandatory): settings.gradle.kts (pluginManagement and dependencyResolutionManagement with google() and mavenCentral(), rootProject.name, include(":app")); root build.gradle.kts with plugins { id("com.android.application") version "8.5.2" apply false; id("org.jetbrains.kotlin.android") version "1.9.24" apply false }; gradle.properties (android.useAndroidX=true, org.gradle.jvmargs=-Xmx2048m, kotlin.code.style=official, android.nonTransitiveRClass=true); gradle/wrapper/gradle-wrapper.properties with distributionUrl https://services.gradle.org/distributions/gradle-8.7-bin.zip; app/build.gradle.kts (namespace, compileSdk 34, defaultConfig applicationId/minSdk 24/targetSdk 34/versionCode 1/versionName "1.0", compileOptions and kotlinOptions jvmTarget 17, dependencies androidx.core:core-ktx:1.13.1, androidx.appcompat:appcompat:1.7.0, com.google.android.material:material:1.12.0, androidx.constraintlayout:constraintlayout:2.1.4 as needed); app/proguard-rules.pro; app/src/main/AndroidManifest.xml (exported=true on the launcher activity, android:icon and android:label); app/src/main/res/values/strings.xml, themes.xml (Theme.Material3 or Theme.MaterialComponents parent that exists in the dependencies); a launcher icon as XML drawables (res/drawable/ic_launcher_foreground.xml plus res/mipmap-anydpi-v26/ic_launcher.xml adaptive icon with a color background), no PNG; .gitignore; README.md explaining: open the folder in Android Studio, let Gradle sync, press Run (Android Studio regenerates the wrapper jar and gradlew from gradle-wrapper.properties). Do not include binary files. Prefer simple, robust code (View-based or plain Compose only if you add all Compose config correctly). Never claim the project builds unless build_apk returned built:true; the APK is debug-signed for sideloading (user must allow installs from this source), not Play Store ready. Never put secrets in files: the build repo is public. In your final answer give a short summary, the file count, the APK result, and the honest limits.' },
   files: { id: 'files', name: 'وكيل الملفات', tools: ['read_file', 'create_document', 'generate_image', 'edit_image'],
     instructions: 'You are the Files Agent. Read the user\'s uploaded files, analyse and summarise them, and create real DOCX/XLSX/PPTX/PDF files when asked. Do not claim a file exists unless create_document succeeded.' },
 };
