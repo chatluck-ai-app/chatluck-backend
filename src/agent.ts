@@ -3,13 +3,13 @@ import type { Db } from './db.ts';
 import type { Provider, ChatMsg } from './providers/types.ts';
 import { TOOLS, AGENTS, toolSpecs, type ToolCtx } from './tools/index.ts';
 import { memoryPrompt } from './memory.ts';
-import { extractText } from './files.ts';
+import { extractText, isImage } from './files.ts';
 
 export type TaskStatus = 'pending' | 'running' | 'waiting_approval' | 'completed' | 'failed' | 'partially_completed' | 'canceled';
 export type Emit = (event: string, data: any) => void;
 const MAX_ITER = 6;
 const MAX_TOOL_OUT = 10000;
-const HONESTY = `Rules: Be honest. Never claim you did something unless a tool result shows it. Never invent prices, dates, availability, sources or file contents. If a tool fails, say so plainly. Label facts (with sources) vs assumptions vs predictions. Do not take decisions for the user. Do not send, pay, book or publish anything. Answer in the user's language (Arabic by default).`;
+const HONESTY = `Rules: Be honest. Never claim you did something unless a tool result shows it. Never invent prices, dates, availability, sources or file contents. If a tool fails, say so plainly and in the same message offer the closest thing you CAN do or say exactly what is needed to proceed. Never answer with a bare "I can't"; always propose a concrete next step. You have tools for images (generate_image, edit_image), documents and project zips: use them instead of refusing. Label facts (with sources) vs assumptions vs predictions. Do not take decisions for the user. Do not send, pay, book or publish anything. Answer in the user's language (Arabic by default).`;
 export interface TaskState { messages: ChatMsg[]; pending: { id: string; name: string; arguments: string }[]; approved: string[]; rejected: string[]; iter: number }
 
 export async function createTask(db: Db, o: { userId: string; goal: string; agent?: string; model: string; conversationId?: string | null; fileIds?: string[] }) {
@@ -100,7 +100,7 @@ export async function runTask(db: Db, provider: Provider, taskId: string, emit: 
       const final = resp.content.trim(); if (!final) throw new Error('النموذج أعاد رداً فارغاً.');
       const files = await db.all('SELECT id,name,data FROM files WHERE task_id=?', taskId) as any[];
       let filesOk = true;
-      for (const f of files) { try { const txt = await extractText(f.name, Buffer.from(f.data, 'base64')); if (!txt && !/\.xlsx$/.test(f.name)) filesOk = false; } catch { filesOk = false; } }
+      for (const f of files) { if (isImage(f.name)) continue; try { const txt = await extractText(f.name, Buffer.from(f.data, 'base64')); if (!txt && !/\.xlsx$/.test(f.name)) filesOk = false; } catch { filesOk = false; } }
       if (files.length) { const vi = await addStep(db, taskId, 'verify', 'final', { files: files.map(f => f.name) }, { reopened: filesOk }, filesOk ? 'ok' : 'failed'); emit('step', { idx: vi, kind: 'verify', tool: 'final', status: filesOk ? 'ok' : 'failed', preview: filesOk ? 'أعيد فتح كل الملفات الناتجة' : 'تعذر فتح بعض الملفات' }); if (!filesOk) failures++; }
       const unrecovered = [...failedTools].filter(n => !recovered.has(n));
       const status: TaskStatus = (unrecovered.length || !filesOk) ? 'partially_completed' : 'completed';
