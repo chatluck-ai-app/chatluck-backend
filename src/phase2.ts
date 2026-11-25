@@ -39,6 +39,10 @@ export function makeService(db: Db, registry: ModelRegistry, fetchImpl?: typeof 
     if (!prov) return { error: 'model_unavailable' } as const;
     return { run: () => runTask(db, prov, taskId, emit, signal, { fetchImpl }) } as const;
   }
+  async function restart(taskId: string, emit: Emit, signal: AbortSignal) {
+    const t: any = await db.get('SELECT model FROM tasks WHERE id=?', taskId); if (!t) return null; const prov = registry.provider(String(t.model).split(':')[0]); if (!prov) return null;
+    return { run: () => runTask(db, prov, taskId, emit, signal, { fetchImpl }) } as const;
+  }
   async function storeFile(u: AgentUser, name: string, buf: Buffer, mime?: string) {
     if (buf.length > MAX_UPLOAD) throw Object.assign(new Error('الملف أكبر من 10 ميجا.'), { code: 'too_large' });
     const ext = extOf(name); if (!MIME[ext]) throw Object.assign(new Error('نوع الملف غير مدعوم: ' + ext), { code: 'unsupported' });
@@ -50,7 +54,7 @@ export function makeService(db: Db, registry: ModelRegistry, fetchImpl?: typeof 
     await db.run('INSERT INTO files(id,user_id,name,mime,size,origin,text,data,created_at) VALUES(?,?,?,?,?,?,?,?,?)', id, u.id, name.slice(0, 120), mime || MIME[ext], buf.length, 'upload', text, buf.toString('base64'), Date.now());
     return { id, name, size: buf.length, chars: text?.length ?? null };
   }
-  return { start, resume, storeFile, defaultModel };
+  return { start, resume, restart, storeFile, defaultModel };
 }
 export type Service = ReturnType<typeof makeService>;
 
