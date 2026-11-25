@@ -14,11 +14,26 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS usage_records(user_id TEXT NOT NULL, day TEXT, kind TEXT, model TEXT, chars_in INTEGER, chars_out INTEGER)`,
   `CREATE INDEX IF NOT EXISTS ix_usage ON usage_records(user_id, day, kind)`,
   `CREATE TABLE IF NOT EXISTS assistants(id TEXT PRIMARY KEY, user_id TEXT, name TEXT, instructions TEXT, builtin INTEGER DEFAULT 0)`,
+  `CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, conversation_id TEXT, title TEXT, agent TEXT, model TEXT, status TEXT, state TEXT, result TEXT, error TEXT, created_at BIGINT, updated_at BIGINT)`,
+  `CREATE INDEX IF NOT EXISTS ix_tasks_user ON tasks(user_id, updated_at)`,
+  `CREATE TABLE IF NOT EXISTS task_steps(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, idx INTEGER, kind TEXT, tool TEXT, args TEXT, output TEXT, status TEXT, error TEXT, created_at BIGINT)`,
+  `CREATE INDEX IF NOT EXISTS ix_steps_task ON task_steps(task_id, idx)`,
+  `CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT, mime TEXT, size INTEGER, origin TEXT, text TEXT, data TEXT, task_id TEXT, created_at BIGINT)`,
+  `CREATE INDEX IF NOT EXISTS ix_files_user ON files(user_id, created_at)`,
+  `CREATE TABLE IF NOT EXISTS memories(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT, content TEXT, created_at BIGINT)`,
+  `CREATE INDEX IF NOT EXISTS ix_mem_user ON memories(user_id, created_at)`,
+  `CREATE TABLE IF NOT EXISTS user_settings(user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, memory_enabled INTEGER DEFAULT 1)`,
+  `CREATE TABLE IF NOT EXISTS reminders(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT, due_at BIGINT, status TEXT, created_at BIGINT, sent_at BIGINT)`,
+  `CREATE INDEX IF NOT EXISTS ix_rem_due ON reminders(status, due_at)`,
+  `CREATE TABLE IF NOT EXISTS tg_links(chat_id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, tg_user_id TEXT, agent TEXT, created_at BIGINT)`,
+  `CREATE TABLE IF NOT EXISTS tg_seen(update_id BIGINT PRIMARY KEY, at BIGINT)`,
+  `CREATE TABLE IF NOT EXISTS tg_approvals(token TEXT PRIMARY KEY, task_id TEXT, call_id TEXT, chat_id TEXT, user_id TEXT)`,
   `CREATE TABLE IF NOT EXISTS plan_limits(plan TEXT PRIMARY KEY, daily_messages INTEGER)`,
 ];
 async function init(db: Db) {
   for (const s of SCHEMA) await db.run(s);
   await db.run('INSERT INTO plan_limits(plan,daily_messages) VALUES(?,?) ON CONFLICT(plan) DO NOTHING', 'free', config.freeDailyMessages);
+  await db.run('INSERT INTO plan_limits(plan,daily_messages) VALUES(?,?) ON CONFLICT(plan) DO NOTHING', 'owner', 500);
   await db.run('INSERT INTO plan_limits(plan,daily_messages) VALUES(?,?) ON CONFLICT(plan) DO NOTHING', 'guest', config.guestDailyMessages);
   return db;
 }
