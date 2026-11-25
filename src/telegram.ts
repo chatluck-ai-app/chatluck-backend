@@ -9,6 +9,8 @@ import { extOf, isImage, MIME } from './files.ts';
 export interface TgOptions { token: string; pairingCode: string; apiBase?: string; fetchImpl?: typeof fetch; sync?: boolean; allowMore?: boolean }
 const STATUS_ICON: Record<string, string> = { completed: '✅', failed: '❌', partially_completed: '⚠️', waiting_approval: '⏳', canceled: '🚫', running: '🔄', pending: '🕓' };
 const STATUS_AR: Record<string, string> = { completed: 'مكتملة', failed: 'فشلت', partially_completed: 'مكتملة جزئياً', waiting_approval: 'بانتظار موافقتك', canceled: 'ملغاة', running: 'قيد التنفيذ', pending: 'في الانتظار' };
+const DEV_HELP = 'وحدة المهندس البرمجي: /develop /website /android /backend /debug /test /build /projects. ارفع ZIP لمشروعك واطلب تعديله أو إصلاحه أو اختباره. الاختبارات والبناء بتتنفذ فعلاً على GitHub Actions (من 2 لـ 8 دقائق) والنتائج حقيقية. المشاريع مش بتترفع لأي مكان بدون إذنك.';
+const DEV_MENU = { keyboard: [[{ text: '💻 /develop' }, { text: '🌐 /website' }], [{ text: '📱 /android' }, { text: '🖥️ /backend' }], [{ text: '🔧 /debug' }, { text: '🧪 /test' }], [{ text: '📦 /build' }, { text: '📁 /projects' }], [{ text: '📊 /status' }, { text: '📚 /tasks' }]], resize_keyboard: true };
 const HELP = `أنا Chat Luck. اكتب لي أي طلب وأنفّذه بالأدوات المتاحة فعلاً: بحث على الإنترنت بمصادر، قراءة الملفات اللي ترسلها (PDF وWord وExcel وPowerPoint وصور)، إنشاء ملفات DOCX/XLSX/PPTX/PDF، تذكيرات، وذاكرة تتحكم فيها.
 
 الأوامر:
@@ -105,7 +107,22 @@ export function registerTelegram(app: FastifyInstance, db: Db, svc: Service, opt
   async function handleCommand(chat: string, link: any, text: string) {
     const [cmd, ...rest] = text.trim().split(/\s+/); const arg = rest.join(' ');
     const c = cmd.toLowerCase().replace(/@\w+$/, '');
-    if (c === '/start' || c === '/help') return send(chat, HELP);
+    if (c === '/start' || c === '/help') return send(chat, HELP + '\n\n' + DEV_HELP, { reply_markup: DEV_MENU });
+    const DEVCMD: Record<string, [string, string]> = {
+      '/develop': ['Software task', 'اكتب وصف الكود المطلوب'], '/website': ['Build a website', 'اكتب وصف الموقع'], '/android': ['Build an Android app (Kotlin, standard Android Studio project), run tests where possible and build the APK', 'اكتب وصف التطبيق'],
+      '/backend': ['Build a backend / server project with real tests', 'اكتب وصف الخادم'], '/debug': ['Diagnose and fix the errors in the attached project, run the tests before and after', 'ارفع ملف ZIP للمشروع واكتب الخطأ'],
+      '/test': ['Run and report the tests of the attached project (fix failures if asked)', 'ارفع ملف ZIP للمشروع'], '/build': ['Build the attached or described Android project into an APK', 'ارفع ZIP أو اكتب وصف التطبيق'],
+    };
+    if (DEVCMD[c]) {
+      if (!arg.trim() && !/(zip|مرفوع)/.test(c)) { const recentZip = await db.get("SELECT id FROM files WHERE user_id=? AND origin='upload' AND created_at>?", link.user_id, Date.now() - 20 * 60_000); if (!recentZip) return send(chat, DEVCMD[c][1] + ' بعد الأمر، مثال: ' + c + ' ...'); }
+      const fileIds = (await db.all("SELECT id FROM files WHERE user_id=? AND origin='upload' AND created_at>? ORDER BY created_at DESC LIMIT 3", link.user_id, Date.now() - 20 * 60_000) as any[]).map(r => r.id);
+      void api('sendChatAction', { chat_id: chat, action: 'typing' });
+      await runGoal(chat, { ...link, agent: 'dev' }, DEVCMD[c][0] + (arg ? ': ' + arg : ''), fileIds); return;
+    }
+    if (c === '/projects') {
+      const rows = await db.all("SELECT id,name,size,created_at FROM files WHERE user_id=? AND origin='generated' AND (name LIKE '%.zip' OR name LIKE '%.apk') ORDER BY created_at DESC LIMIT 10", link.user_id) as any[];
+      return send(chat, rows.length ? 'مشاريعك وملفاتك الجاهزة:\n' + rows.map((r, i) => `${i + 1}. ${r.name} (${(r.size / 1048576).toFixed(1)} MB)`).join('\n') + '\n\nللإرسال: /getfile <رقم من /files>. لتعديل مشروع: ابعت الـ ZIP واكتب التعديل المطلوب.' : 'لا توجد مشاريع بعد. جرّب /android أو /website.');
+    }
     if (c === '/tasks' || c === '/todo') {
       const rows = await db.all('SELECT id,title,status FROM tasks WHERE user_id=? ORDER BY updated_at DESC LIMIT 10', link.user_id) as any[];
       return send(chat, rows.length ? rows.map((r, i) => `${i + 1}. ${STATUS_ICON[r.status] ?? ''} ${r.title} (${shortId(r.id)})`).join('\n') : 'لا توجد مهام بعد.');
