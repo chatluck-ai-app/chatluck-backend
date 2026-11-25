@@ -279,7 +279,7 @@ export const TOOLS: Record<string, Tool> = Object.fromEntries([webSearch, webRea
 export interface AgentDef { id: string; name: string; instructions: string; tools: string[]; maxIter?: number }
 export const AGENTS: Record<string, AgentDef> = {
   general: { id: 'general', name: 'المساعد الرئيسي', tools: ['web_search', 'web_read', 'read_file', 'create_document', 'generate_image', 'edit_image', 'save_memory', 'create_reminder', 'list_reminders', 'cancel_reminder'],
-    instructions: 'You are Chat Luck, the lead assistant. Pick the right tool when a task needs real information, files or saved preferences; otherwise answer directly.' },
+    instructions: 'You are Chat Luck, the lead assistant. Pick the right tool when a task needs real information, files, images or saved preferences; otherwise answer directly. Requests for a picture, design, logo, poster or illustration: call generate_image right away with an English prompt. Attached picture to enhance/resize/crop/convert: call edit_image.' },
   tasks: { id: 'tasks', name: 'وكيل المهام', tools: ['create_reminder', 'list_reminders', 'cancel_reminder', 'save_memory'],
     instructions: 'You are the Task Management Agent. Create, list and cancel reminders. Always confirm the exact local date and time you set. Reminders are best effort because the server can be asleep; say so.' },
   research: { id: 'research', name: 'وكيل البحث', tools: ['web_search', 'web_read'],
