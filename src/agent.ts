@@ -46,7 +46,7 @@ export async function runTask(db: Db, provider: Provider, taskId: string, emit: 
   const ctx: ToolCtx = { db, userId: t.user_id, taskId, provider, model: String(t.model).split(':').slice(1).join(':'), signal, fetchImpl: opts.fetchImpl };
   await setStatus(db, taskId, 'running'); emit('task', { id: taskId, status: 'running', agent: agent.id });
   const cancelled = async () => ((await db.get('SELECT status s FROM tasks WHERE id=?', taskId)) as any)?.s === 'canceled' || signal.aborted;
-  let failures = 0, recovered = new Set<string>(); const failedTools = new Set<string>();
+  let nudges = 0; let failures = 0, recovered = new Set<string>(); const failedTools = new Set<string>();
   const prior: any = await db.get("SELECT count(*) c FROM task_steps WHERE task_id=? AND status='failed'", taskId); failures = Number(prior.c);
   try {
     for (;;) {
@@ -96,6 +96,15 @@ export async function runTask(db: Db, provider: Provider, taskId: string, emit: 
         st.pending = resp.toolCalls.map(c => ({ id: c.id, name: c.name, arguments: c.arguments }));
         await addStep(db, taskId, 'model', null, resp.toolCalls.map(c => c.name), undefined, 'ok');
         continue;
+      }
+      // 2b. dev agent that only announced a plan: push it to actually do the work (cheap models often stop early)
+      if (agent.id === 'dev' && nudges < 4) {
+        const made: any = await db.get('SELECT count(*) c FROM files WHERE task_id=?', taskId);
+        if (!Number(made.c)) {
+          nudges++; st.messages.push({ role: 'assistant', content: resp.content || '(no action)' });
+          st.messages.push({ role: 'user', content: 'You have not produced any file yet. Do not describe or promise: call the tools NOW (project_write with complete files, then build_apk or project_zip). Continue the work from where it stands.' });
+          continue;
+        }
       }
       // 3. final answer + verification of produced files
       const final = resp.content.trim(); if (!final) throw new Error('النموذج أعاد رداً فارغاً.');
