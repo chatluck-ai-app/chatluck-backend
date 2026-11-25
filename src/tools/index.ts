@@ -132,13 +132,14 @@ const projectWrite: Tool = {
       added += f.content.length;
     }
     if (Number(tot.c) + files.length > 1000 || Number(tot.b) + added > 6_000_000) throw new Error('project size limit reached (1000 files / 6 MB)');
+    for (const f of files) { let c: string = f.content.replace(/^\uFEFF/, ''); const m = c.match(/^\s*```[a-zA-Z0-9]*\r?\n([\s\S]*?)\r?\n?```\s*$/); if (m) c = m[1]; if (/\.xml$/.test(f.path)) c = c.replace(/^\s+(?=<)/, ''); f.content = c; }
     const same: string[] = [];
     for (const f of files) { const ex: any = await ctx.db.get('SELECT content FROM project_files WHERE task_id=? AND path=?', ctx.taskId, f.path); if (ex && ex.content === f.content) same.push(f.path); }
     for (const f of files) { await ctx.db.run('DELETE FROM project_files WHERE task_id=? AND path=?', ctx.taskId, f.path); await ctx.db.run('INSERT INTO project_files(task_id,path,content) VALUES(?,?,?)', ctx.taskId, f.path, f.content); }
     const n: any = await ctx.db.get('SELECT count(*) c FROM project_files WHERE task_id=?', ctx.taskId);
     const all = await ctx.db.all('SELECT path FROM project_files WHERE task_id=? ORDER BY path', ctx.taskId) as any[];
     const plan = await planProgress(ctx);
-    return { output: { saved: files.map((f: any) => f.path), total_files: Number(n.c), plan: plan ? { missing_total: plan.missing_total, current_stage: plan.current_stage, write_next: plan.write_next } : undefined, already_identical: same.length ? same : undefined, all_paths_so_far: all.slice(0, 300).map(r => r.path), next: same.length ? 'These files were already saved with identical content: do NOT rewrite them. Write only files that are still missing, then call build_apk.' : 'Write only the files still missing from your plan (see all_paths_so_far), then call build_apk. Never rewrite a file that is already listed.' } };
+    return { output: { saved: files.map((f: any) => f.path), total_files: Number(n.c), plan: plan ? { missing_total: plan.missing_total, current_stage: plan.current_stage, write_next: plan.write_next } : undefined, already_identical: same.length ? same : undefined, all_paths_so_far: all.slice(0, 300).map(r => r.path), next: same.length ? 'These files were already saved with identical content: rewriting the same text cannot fix a failed build. If a build/check failed, read the exact error, call project_read on the file, and change something DIFFERENT (or fix the real culprit in another file). Do NOT rewrite them unchanged. Write only files that are still missing, then call build_apk.' : 'Write only the files still missing from your plan (see all_paths_so_far), then call build_apk. Never rewrite a file that is already listed.' } };
   },
 };
 async function planProgress(ctx: ToolCtx) {
