@@ -2,9 +2,16 @@ import { config } from '../config.ts';
 import { OpenAICompat } from './openaiCompat.ts';
 import type { Provider, ProviderModel } from './types.ts';
 export function buildProviders(): Provider[] {
+  const gem = new OpenAICompat('gemini', config.gemini.base, config.gemini.key, (process.env.GEMINI_MODELS ?? 'gemini-flash-lite-latest,gemini-flash-latest').split(','), (process.env.GEMINI_API_KEYS ?? '').split(',').map(s => s.trim()).filter(Boolean));
+  const fb: [string, string, string, string][] = [
+    ['groq', 'https://api.groq.com/openai/v1', process.env.GROQ_API_KEY ?? '', process.env.GROQ_MODEL ?? 'llama-3.3-70b-versatile'],
+    ['openrouter', 'https://openrouter.ai/api/v1', process.env.OPENROUTER_API_KEY ?? '', process.env.OPENROUTER_MODEL ?? 'meta-llama/llama-3.3-70b-instruct:free'],
+    ['huggingface', 'https://router.huggingface.co/v1', process.env.HF_TOKEN ?? '', process.env.HF_MODEL ?? 'meta-llama/Llama-3.3-70B-Instruct'],
+  ];
+  for (const [n, base, key, model] of fb) gem.fallbacks.push({ p: new OpenAICompat(n, base, key, [model]), model });
   return [
     new OpenAICompat('openai', config.openai.base, config.openai.key, (process.env.OPENAI_MODELS ?? 'gpt-4o-mini,gpt-4o').split(',')),
-    new OpenAICompat('gemini', config.gemini.base, config.gemini.key, (process.env.GEMINI_MODELS ?? 'gemini-flash-lite-latest,gemini-flash-latest').split(',')),
+    gem,
   ];
 }
 export class ModelRegistry {
