@@ -4,7 +4,7 @@ import { isIP } from 'node:net';
 import type { Db } from '../db.ts';
 import type { Provider, ToolSpec } from '../providers/types.ts';
 import { addMemory, MemoryError } from '../memory.ts';
-import { buildApk } from './apk.ts';
+import { buildApk, testWorkflow, testScript, type CiKind } from './apk.ts';
 import { createDocument, verifyDocument, extractText, isImage, extOf, MIME, type DocSpec } from '../files.ts';
 
 export interface ToolCtx { db: Db; userId: string; taskId: string; provider: Provider; model: string; signal: AbortSignal; fetchImpl?: typeof fetch }
@@ -195,6 +195,51 @@ const buildApkTool: Tool = {
     return { output: { built: true, file_id: id, name: fname, size: res.apk!.length, run: res.runUrl, note: 'debug-signed APK for sideloading' }, verified: { ok: true, detail: `تم بناء APK فعليًا عبر GitHub Actions (${Math.round(res.apk!.length / 1024)} KB)` }, fileId: id };
   },
 };
+const runTests: Tool = {
+  name: 'run_tests', description: 'Really run the saved project\'s tests (or any build/check command) on GitHub Actions (free, isolated, no secrets, 15 min limit) and return the real output. kind: node, python, android (gradle unit tests), web, custom. Optional command overrides the default (bash lines, e.g. "npm ci && npm test"). If tests fail you get the error lines: fix the files with project_write and run again. Never claim tests passed unless this returns passed:true.',
+  parameters: { type: 'object', properties: { kind: { type: 'string', enum: ['node', 'python', 'android', 'web', 'custom'] }, command: { type: 'string' } }, required: ['kind'] },
+  async run({ kind, command }, ctx) {
+    const token = process.env.GITHUB_TOKEN, repo = process.env.GITHUB_BUILD_REPO;
+    if (!token || !repo) throw new Error('تشغيل الاختبارات غير مفعّل على هذا الخادم');
+    if (!['node', 'python', 'android', 'web', 'custom'].includes(kind)) throw new Error('bad kind');
+    if (String(command ?? '').length > 2000) throw new Error('command too long');
+    const rows = await ctx.db.all('SELECT path, content FROM project_files WHERE task_id=? ORDER BY path', ctx.taskId) as any[];
+    if (!rows.length) throw new Error('no project files saved yet');
+    const files = rows.filter(r => !r.path.startsWith('.ci/')).concat([{ path: '.ci/run.sh', content: testScript(kind as CiKind, command) }]);
+    const res = await buildApk({ token, repo, files, apk: false, workflow: testWorkflow(kind as CiKind), fetchImpl: ctx.fetchImpl, signal: ctx.signal, maxWaitMs: 9 * 60000, id: 't-' + ctx.taskId.replace(/[^\w]/g, '').slice(0, 10) + '-' + Date.now().toString(36) });
+    const out = { passed: res.ok, run: res.runUrl, output_tail: res.logTail, errors: res.ok ? undefined : res.errorLines, note: res.note };
+    return { output: out, verified: { ok: res.ok, detail: res.ok ? 'اجتازت الاختبارات فعليًا على GitHub Actions' : 'فشلت الاختبارات أو الأمر: ' + (res.note ?? '') } };
+  },
+};
+const TEXT_EXT = /\.(kt|kts|java|xml|gradle|properties|pro|md|txt|json|ya?ml|toml|html?|css|scss|js|mjs|cjs|jsx|ts|tsx|py|sql|sh|env\.example|gitignore|cfg|ini|csv|svg|c|h|cpp|go|rs|php|rb|swift|dart|vue)$/i;
+const projectLoad: Tool = {
+  name: 'project_load', description: 'Load an uploaded or previously generated .zip (by file_id) into the project workspace so you can read, edit, test and re-package it. Binary files are skipped and listed. The original file is never modified: results are saved as a new zip.',
+  parameters: { type: 'object', properties: { file_id: { type: 'string' } }, required: ['file_id'] },
+  async run({ file_id }, ctx) {
+    const f: any = await ctx.db.get('SELECT name,data FROM files WHERE id=? AND user_id=?', file_id, ctx.userId); if (!f) throw new Error('file not found');
+    if (!/\.zip$/i.test(f.name)) throw new Error('only .zip files can be loaded');
+    const JSZip: any = (await import('jszip')).default; const z = await JSZip.loadAsync(Buffer.from(f.data, 'base64'));
+    const names = Object.keys(z.files).filter(n => !z.files[n].dir); if (names.length > 1000) throw new Error('zip has more than 1000 files');
+    const skipped: string[] = []; let loaded = 0, bytes = 0;
+    for (const n of names) {
+      const clean = n.replace(/^\.?\//, ''); const top = clean.split('/')[0];
+      if (!SAFE_PATH(clean) || /(^|\/)(node_modules|\.git|build|\.gradle)\//.test(clean) || !TEXT_EXT.test(clean)) { skipped.push(clean); continue; }
+      const c: string = await z.files[n].async('string'); if (c.length > 60000 || c.includes('\u0000')) { skipped.push(clean); continue; }
+      bytes += c.length; if (bytes > 6_000_000) { skipped.push(clean); continue; }
+      await ctx.db.run('DELETE FROM project_files WHERE task_id=? AND path=?', ctx.taskId, clean); await ctx.db.run('INSERT INTO project_files(task_id,path,content) VALUES(?,?,?)', ctx.taskId, clean, c); loaded++; void top;
+    }
+    return { output: { loaded, skipped_count: skipped.length, skipped_sample: skipped.slice(0, 30), note: 'Use project_read to view files, project_write to change them, run_tests / build_apk to verify, project_zip to export a NEW zip.' } };
+  },
+};
+const projectRead: Tool = {
+  name: 'project_read', description: 'Read saved project files. With no path: list all paths. With path: return that file content (up to 12000 chars; use offset for more).',
+  parameters: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer' } } },
+  async run({ path, offset }, ctx) {
+    if (!path) { const rows = await ctx.db.all('SELECT path,length(content) len FROM project_files WHERE task_id=? ORDER BY path', ctx.taskId) as any[]; return { output: { total: rows.length, files: rows.slice(0, 500).map(r => r.path + ' (' + r.len + ')') } }; }
+    const r: any = await ctx.db.get('SELECT content FROM project_files WHERE task_id=? AND path=?', ctx.taskId, String(path)); if (!r) throw new Error('file not found in project');
+    const o = Math.max(0, Number(offset) || 0); return { output: { path, length: r.content.length, offset: o, content: r.content.slice(o, o + 12000), more: r.content.length > o + 12000 } };
+  },
+};
 const generateImage: Tool = {
   name: 'generate_image', description: 'Generate a new image from a text prompt (free services, no key: Pollinations, then Stable Horde). Write the prompt in English for best results (translate Arabic requests). Returns a file the user receives.',
   parameters: { type: 'object', properties: { prompt: { type: 'string' }, width: { type: 'integer' }, height: { type: 'integer' }, seed: { type: 'integer' } }, required: ['prompt'] },
@@ -310,7 +355,7 @@ const cancelReminder: Tool = {
     await ctx.db.run("UPDATE reminders SET status='canceled' WHERE id=?", id); return { output: { canceled: id } };
   },
 };
-export const TOOLS: Record<string, Tool> = Object.fromEntries([webSearch, webRead, readFile, createDoc, generateImage, editImage, projectWrite, projectStatus, projectZip, buildApkTool, saveMemory, createReminder, listReminders, cancelReminder].map(t => [t.name, t]));
+export const TOOLS: Record<string, Tool> = Object.fromEntries([webSearch, webRead, readFile, createDoc, generateImage, editImage, projectWrite, projectStatus, projectZip, buildApkTool, runTests, projectLoad, projectRead, saveMemory, createReminder, listReminders, cancelReminder].map(t => [t.name, t]));
 
 export interface AgentDef { id: string; name: string; instructions: string; tools: string[]; maxIter?: number }
 export const AGENTS: Record<string, AgentDef> = {
@@ -320,8 +365,8 @@ export const AGENTS: Record<string, AgentDef> = {
     instructions: 'You are the Task Management Agent. Create, list and cancel reminders. Always confirm the exact local date and time you set. Reminders are best effort because the server can be asleep; say so.' },
   research: { id: 'research', name: 'وكيل البحث', tools: ['web_search', 'web_read'],
     instructions: 'You are the Research Agent. Search the web, open pages when needed, compare sources and report with source links. Label each claim as confirmed (has a source) or unconfirmed. Never state recent facts, prices or availability without a source.' },
-  dev: { id: 'dev', name: 'وكيل البرمجة', maxIter: 60, tools: ['project_write', 'project_status', 'project_zip', 'build_apk', 'web_search', 'web_read'],
-    instructions: 'You are the Software Project Agent. You generate real multi-file source projects, and for Android you produce a project that opens and builds in Android Studio AND a real APK. Method: 1) write a short plan with the full file tree, 2) save files with project_write in batches of at most 12 files, each file COMPLETE and consistent with the others (package names, imports, resource ids, manifest entries), no TODO placeholders, 3) project_status to check nothing is missing, 4) for Android call build_apk (real compile on GitHub Actions, 3-8 minutes). If it fails you receive the compiler errors: fix the exact files with project_write and call build_apk again, up to 3 attempts. After a successful build also call project_zip with kind android so the user gets the source too. STANDARD ANDROID STUDIO LAYOUT (mandatory): settings.gradle.kts (pluginManagement and dependencyResolutionManagement with google() and mavenCentral(), rootProject.name, include(":app")); root build.gradle.kts with plugins { id("com.android.application") version "8.5.2" apply false; id("org.jetbrains.kotlin.android") version "1.9.24" apply false }; gradle.properties (android.useAndroidX=true, org.gradle.jvmargs=-Xmx2048m, kotlin.code.style=official, android.nonTransitiveRClass=true); gradle/wrapper/gradle-wrapper.properties with distributionUrl https://services.gradle.org/distributions/gradle-8.7-bin.zip; app/build.gradle.kts (namespace, compileSdk 34, defaultConfig applicationId/minSdk 24/targetSdk 34/versionCode 1/versionName "1.0", compileOptions and kotlinOptions jvmTarget 17, dependencies androidx.core:core-ktx:1.13.1, androidx.appcompat:appcompat:1.7.0, com.google.android.material:material:1.12.0, androidx.constraintlayout:constraintlayout:2.1.4 as needed); app/proguard-rules.pro; app/src/main/AndroidManifest.xml (exported=true on the launcher activity, android:icon and android:label); app/src/main/res/values/strings.xml, themes.xml (Theme.Material3 or Theme.MaterialComponents parent that exists in the dependencies); a launcher icon as XML drawables (res/drawable/ic_launcher_foreground.xml plus res/mipmap-anydpi-v26/ic_launcher.xml adaptive icon with a color background), no PNG; .gitignore; README.md explaining: open the folder in Android Studio, let Gradle sync, press Run (Android Studio regenerates the wrapper jar and gradlew from gradle-wrapper.properties). Do not include binary files. Prefer simple, robust code (View-based or plain Compose only if you add all Compose config correctly). Never claim the project builds unless build_apk returned built:true; the APK is debug-signed for sideloading (user must allow installs from this source), not Play Store ready. Never put secrets in files: the build repo is public. In your final answer give a short summary, the file count, the APK result, and the honest limits.' },
+  dev: { id: 'dev', name: 'وكيل البرمجة', maxIter: 60, tools: ['project_write', 'project_status', 'project_read', 'project_load', 'project_zip', 'build_apk', 'run_tests', 'web_search', 'web_read'],
+    instructions: 'You are the Software Project Agent. You generate real multi-file source projects, and for Android you produce a project that opens and builds in Android Studio AND a real APK. Method: 1) write a short plan with the full file tree, 2) save files with project_write in batches of at most 12 files, each file COMPLETE and consistent with the others (package names, imports, resource ids, manifest entries), no TODO placeholders, 3) project_status to check nothing is missing, 4) for Android call build_apk (real compile on GitHub Actions, 3-8 minutes). If it fails you receive the compiler errors: fix the exact files with project_write and call build_apk again, up to 3 attempts. After a successful build also call project_zip with kind android so the user gets the source too. STANDARD ANDROID STUDIO LAYOUT (mandatory): settings.gradle.kts (pluginManagement and dependencyResolutionManagement with google() and mavenCentral(), rootProject.name, include(":app")); root build.gradle.kts with plugins { id("com.android.application") version "8.5.2" apply false; id("org.jetbrains.kotlin.android") version "1.9.24" apply false }; gradle.properties (android.useAndroidX=true, org.gradle.jvmargs=-Xmx2048m, kotlin.code.style=official, android.nonTransitiveRClass=true); gradle/wrapper/gradle-wrapper.properties with distributionUrl https://services.gradle.org/distributions/gradle-8.7-bin.zip; app/build.gradle.kts (namespace, compileSdk 34, defaultConfig applicationId/minSdk 24/targetSdk 34/versionCode 1/versionName "1.0", compileOptions and kotlinOptions jvmTarget 17, dependencies androidx.core:core-ktx:1.13.1, androidx.appcompat:appcompat:1.7.0, com.google.android.material:material:1.12.0, androidx.constraintlayout:constraintlayout:2.1.4 as needed); app/proguard-rules.pro; app/src/main/AndroidManifest.xml (exported=true on the launcher activity, android:icon and android:label); app/src/main/res/values/strings.xml, themes.xml (Theme.Material3 or Theme.MaterialComponents parent that exists in the dependencies); a launcher icon as XML drawables (res/drawable/ic_launcher_foreground.xml plus res/mipmap-anydpi-v26/ic_launcher.xml adaptive icon with a color background), no PNG; .gitignore; README.md explaining: open the folder in Android Studio, let Gradle sync, press Run (Android Studio regenerates the wrapper jar and gradlew from gradle-wrapper.properties). Do not include binary files. Prefer simple, robust code (View-based or plain Compose only if you add all Compose config correctly). ENGINEERING MODE: if the user attached a .zip (see Attached files with file_id), call project_load first, then project_read the relevant files before changing them; never guess file contents. Websites: plain HTML/CSS/JS or a small node project, then run_tests kind web. Backend: node or python with real tests, then run_tests kind node/python and fix failures until they pass or you run out of attempts (max 3 fix rounds). Android: write unit tests when asked and run_tests kind android, then build_apk. Always run tests after significant edits, show the real results, and never invent results. Never overwrite the original zip: export with project_zip as a new file. Do not publish or upload anywhere. End with a report using these labels: project name, task type, files created, files modified, errors found, errors fixed, tests run, test results, build status, files ready, remaining issues, and a final status (COMPLETED, FAILED or PARTIALLY COMPLETED). Never claim the project builds unless build_apk returned built:true; the APK is debug-signed for sideloading (user must allow installs from this source), not Play Store ready. Never put secrets in files: the build repo is public. In your final answer give a short summary, the file count, the APK result, and the honest limits.' },
   files: { id: 'files', name: 'وكيل الملفات', tools: ['read_file', 'create_document', 'generate_image', 'edit_image'],
     instructions: 'You are the Files Agent. Read the user\'s uploaded files, analyse and summarise them, and create real DOCX/XLSX/PPTX/PDF files when asked. Do not claim a file exists unless create_document succeeded.' },
 };
