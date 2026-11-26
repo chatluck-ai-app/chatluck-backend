@@ -64,3 +64,13 @@ test('sanitizeXmlContent drops prolog junk before the declaration or first tag',
   assert.equal(sanitizeXmlContent('<a/>'), '<a/>');
   assert.equal(sanitizeXmlContent('no tags at all'), 'no tags at all');
 });
+
+import { PLACEHOLDER_CONTENT, HISTORY_OMITTED } from '../src/tools/index.ts';
+test('PLACEHOLDER_CONTENT matches history placeholders, not real content', () => {
+  assert.ok(PLACEHOLDER_CONTENT.test('[saved]'));
+  assert.ok(PLACEHOLDER_CONTENT.test('  [saved]  '));
+  assert.ok(PLACEHOLDER_CONTENT.test(HISTORY_OMITTED));
+  assert.ok(!PLACEHOLDER_CONTENT.test('<a/>'));
+  assert.ok(!PLACEHOLDER_CONTENT.test('package com.x'));
+  assert.ok(!PLACEHOLDER_CONTENT.test('[saved] more text'));
+});
