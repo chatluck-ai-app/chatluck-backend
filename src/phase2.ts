@@ -69,6 +69,7 @@ export function registerPhase2(app: FastifyInstance, db: Db, svc: Service, U: (r
 
   app.get('/v1/agents', async () => ({ agents: Object.values(AGENTS).map(a => ({ id: a.id, name: a.name, tools: a.tools })) }));
 
+  const runningHere = new Set<string>();
   // Run a task (SSE): events task | step | file | approval | delta | error | done
   app.post('/v1/agent/run', async (req, rep) => {
     const u = U(req); const b = (req.body ?? {}) as any;
@@ -86,7 +87,9 @@ export function registerPhase2(app: FastifyInstance, db: Db, svc: Service, U: (r
     send('task', { id: probe.taskId, status: 'pending', conversationId: convId });
     await db.run('UPDATE tasks SET conversation_id=? WHERE id=?', convId, probe.taskId);
     const { runTask: _r } = await import('./agent.ts');
-    await _r(db, probe.prov, probe.taskId, (ev, d) => { if (ev !== 'task') send(ev, d); else send(ev, { ...d, conversationId: convId }); }, ac.signal, {});
+    runningHere.add(probe.taskId);
+    try { await _r(db, probe.prov, probe.taskId, (ev, d) => { if (ev !== 'task') send(ev, d); else send(ev, { ...d, conversationId: convId }); }, ac.signal, {}); }
+    finally { runningHere.delete(probe.taskId); }
     await saveAnswer(u, convId, probe.taskId);
     try { rep.raw.end(); } catch {}
   });
@@ -97,6 +100,20 @@ export function registerPhase2(app: FastifyInstance, db: Db, svc: Service, U: (r
     if ('error' in r) { send('error', { message: r.error }); return rep.raw.end(); }
     await r.run(); const t: any = await db.get('SELECT conversation_id c FROM tasks WHERE id=?', id); if (t?.c) await saveAnswer(u, t.c, id);
     rep.raw.end();
+  });
+  // Restart a task whose row says "running" but whose process died (deploy/restart/OOM).
+  // State is persisted per step, so the run continues from the last saved point.
+  app.post('/v1/tasks/:id/restart', async (req, rep) => {
+    const u = U(req); const id = (req.params as any).id;
+    const t: any = await db.get('SELECT status, updated_at FROM tasks WHERE id=? AND user_id=?', id, u.id);
+    if (!t) return rep.code(404).send({ error: 'not_found' });
+    if (t.status !== 'running') return rep.code(409).send({ error: 'not_running', message: 'المهمة ليست عالقة في حالة تشغيل.' });
+    if (runningHere.has(id)) return rep.code(409).send({ error: 'already_running', message: 'المهمة تعمل بالفعل على هذا الخادم.' });
+    if (Date.now() - Number(t.updated_at) < 3 * 60000) return rep.code(409).send({ error: 'fresh', message: 'المهمة نشطة حديثاً؛ انتظر دقائق أو اطلب إلغاءها.' });
+    const x = await svc.restart(id, () => {}, new AbortController().signal);
+    if (!x) return rep.code(400).send({ error: 'model_unavailable' });
+    runningHere.add(id); void x.run().catch(() => {}).finally(() => runningHere.delete(id));
+    return { ok: true, restarted: id };
   });
   app.get('/v1/tasks', async (req) => ({ tasks: await db.all('SELECT id,title,agent,model,status,conversation_id,created_at,updated_at FROM tasks WHERE user_id=? ORDER BY updated_at DESC LIMIT 100', U(req).id) }));
   app.get('/v1/tasks/:id', async (req, rep) => {
