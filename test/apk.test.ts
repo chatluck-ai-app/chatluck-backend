@@ -54,3 +54,13 @@ test('checkProject finds package, import, resource and xml problems and passes a
   const iss = checkProject(bad).join('|');
   assert.ok(iss.includes('does not match its folder') && iss.includes('Missing') && iss.includes('string/nope') && iss.includes('a.xml'));
 });
+
+import { sanitizeXmlContent } from '../src/tools/index.ts';
+test('sanitizeXmlContent drops prolog junk before the declaration or first tag', () => {
+  assert.equal(sanitizeXmlContent('Here is the layout:\n<?xml version="1.0"?>\n<a/>'), '<?xml version="1.0"?>\n<a/>');
+  assert.equal(sanitizeXmlContent('\n  <a/>'), '<a/>');
+  assert.equal(sanitizeXmlContent('junk<!-- c -->\n<a/>'), '<!-- c -->\n<a/>');
+  assert.equal(sanitizeXmlContent('<?xml version="1.0"?><a/>'), '<?xml version="1.0"?><a/>');
+  assert.equal(sanitizeXmlContent('<a/>'), '<a/>');
+  assert.equal(sanitizeXmlContent('no tags at all'), 'no tags at all');
+});
