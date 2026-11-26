@@ -202,8 +202,15 @@ export function checkProject(rows: { path: string; content: string }[]) {
   }
   // Resources
   const defs: Record<string, Set<string>> = { string: new Set(), color: new Set(), style: new Set(), dimen: new Set(), layout: new Set(), drawable: new Set(), mipmap: new Set() };
+  // Duplicate resource definitions in the same qualifier folder fail the aapt merge (e.g. "resource color/teal_200 already defined"); different qualifier folders (values-night, values-ar) are legal overrides.
+  const resDef = new Map<string, string>();
   for (const r of rows) {
-    if (/res\/values[^/]*\/.+\.xml$/.test(r.path)) for (const d of r.content.matchAll(/<(string|color|style|dimen|drawable)\s+name="([\w.]+)"/g)) { (defs[d[1]] ??= new Set()).add(d[2].replace(/\./g, '_')); }
+    const dirM = r.path.match(/res\/(values[^/]*)\/.+\.xml$/);
+    if (dirM) for (const d of r.content.matchAll(/<(string|color|style|dimen|drawable|integer|bool|array|plurals)\s+name="([\w.]+)"/g)) {
+      (defs[d[1]] ??= new Set()).add(d[2].replace(/\./g, '_'));
+      const key = `${dirM[1]}|${d[1]}|${d[2].replace(/\./g, '_')}`; const prev = resDef.get(key);
+      if (prev) { const msg = prev === r.path ? `${r.path}: resource ${d[1]}/${d[2]} is defined twice in the same file` : `duplicate resource ${d[1]}/${d[2]}: defined in both ${prev} and ${r.path}`; if (!issues.includes(msg)) issues.push(msg); } else resDef.set(key, r.path);
+    }
     const f = r.path.match(/res\/(layout|drawable|mipmap)[^/]*\/([\w]+)\.\w+$/); if (f) defs[f[1]].add(f[2]);
   }
   const hasRes = Object.values(defs).some(s => s.size);
