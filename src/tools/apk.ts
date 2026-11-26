@@ -32,8 +32,13 @@ export interface BuildOpts { token: string; repo: string; files: { path: string;
 
 export function extractErrors(log: string, max = 40) {
   const lines = log.replace(/\u001b\[[0-9;]*m/g, '').split('\n').map(l => l.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, '').trimEnd());
-  const hit = lines.filter(l => /(^e: |error:|FAILURE:|What went wrong|Execution failed|Could not |Unresolved reference|> Task .* FAILED|AAPT|Manifest merger)/i.test(l));
-  const pick = hit.length ? hit : lines.filter(l => l.trim()).slice(-max);
+  const re = /(^e: |error:|^ERROR:|FAILURE:|What went wrong|Execution failed|Could not |Unresolved reference|> Task .* FAILED|AAPT|Manifest merger)/i;
+  const idx = new Set<number>();
+  lines.forEach((l, i) => { if (re.test(l)) idx.add(i); });
+  // Gradle puts the real reason on the lines right after "What went wrong" -
+  // include them, otherwise the model fixes blind.
+  lines.forEach((l, i) => { if (/What went wrong/.test(l)) { for (let k = i; k <= Math.min(i + 8, lines.length - 1); k++) { if (k > i && /^\*\s/.test(lines[k])) break; idx.add(k); } } });
+  const pick = idx.size ? [...idx].sort((a, b) => a - b).map(i => lines[i]) : lines.filter(l => l.trim()).slice(-max);
   return pick.slice(-max).join('\n').slice(0, 5000);
 }
 
