@@ -17,7 +17,8 @@ export class OpenAICompat implements Provider {
         const r = await fetch(this.base + '/chat/completions', { method: 'POST', headers: this.headers(),
           body: JSON.stringify({ model: id, messages: [{ role: 'user', content: 'ping' }], max_tokens: 4 }), signal: AbortSignal.timeout(20000) });
         if (r.ok) out.push({ id, provider: this.name, label: id });
-      } catch { /* unavailable */ }
+        else console.warn('[models] ' + this.name + '/' + id + ' -> ' + r.status + ' ' + (await r.text().catch(() => '')).slice(0, 160));
+      } catch (e) { console.warn('[models] ' + this.name + '/' + id + ' -> ' + String(e)); }
     }
     return out;
   }
