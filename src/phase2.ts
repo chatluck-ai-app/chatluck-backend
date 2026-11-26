@@ -78,14 +78,17 @@ export function registerPhase2(app: FastifyInstance, db: Db, svc: Service, U: (r
     const probe = await svc.start(u, { goal: b.goal, model: b.model, agent: b.agent, conversationId: convId, fileIds: b.fileIds }, noop, new AbortController().signal).catch((e: any) => ({ error: 'internal', message: String(e.message) } as any));
     if ('error' in probe) return rep.code(probe.error === 'quota' ? 429 : probe.error === 'not_found' ? 404 : 400).send(probe);
     // The probe already created the task; run it with a real emitter.
-    const send = sse(rep); const ac = abortOnClose(rep);
+    // The run must survive the client disconnecting: hosting proxies cap SSE
+    // requests (~15 min), and long builds exceed that. Clients poll /v1/tasks/:id.
+    const sendRaw = sse(rep); const send = (ev: string, d: unknown) => { try { sendRaw(ev, d); } catch {} };
+    const ac = new AbortController();
     await db.run('INSERT INTO messages(id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?)', randomUUID(), convId, 'user', b.goal, Date.now() * 1000);
     send('task', { id: probe.taskId, status: 'pending', conversationId: convId });
     await db.run('UPDATE tasks SET conversation_id=? WHERE id=?', convId, probe.taskId);
     const { runTask: _r } = await import('./agent.ts');
     await _r(db, probe.prov, probe.taskId, (ev, d) => { if (ev !== 'task') send(ev, d); else send(ev, { ...d, conversationId: convId }); }, ac.signal, {});
     await saveAnswer(u, convId, probe.taskId);
-    rep.raw.end();
+    try { rep.raw.end(); } catch {}
   });
   app.post('/v1/tasks/:id/approve', async (req, rep) => {
     const u = U(req); const b = (req.body ?? {}) as any; const id = (req.params as any).id;
