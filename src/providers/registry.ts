@@ -8,14 +8,9 @@ export function buildProviders(): Provider[] {
     ['openrouter', 'https://openrouter.ai/api/v1', process.env.OPENROUTER_API_KEY ?? '', process.env.OPENROUTER_MODEL ?? 'meta-llama/llama-3.3-70b-instruct:free'],
     ['huggingface', 'https://router.huggingface.co/v1', process.env.HF_TOKEN ?? '', process.env.HF_MODEL ?? 'meta-llama/Llama-3.3-70B-Instruct'],
   ];
-  // GitHub Models: free inference with the repo PAT (models.github.ai), no new
-  // account or secret needed. Candidates are pinged at startup; only models the
-  // token can actually call get listed, so unavailable ids are invisible.
-  const ghm = new OpenAICompat('githubmodels', process.env.GHM_BASE_URL ?? 'https://models.github.ai/inference', process.env.GHM_API_KEY ?? (process.env.GITHUB_TOKEN ?? ''), (process.env.GHM_MODELS ?? 'openai/gpt-4o,openai/gpt-4o-mini,meta/Llama-3.3-70B-Instruct,deepseek/DeepSeek-V3-0324').split(','));
   const out: Provider[] = [
     new OpenAICompat('openai', config.openai.base, config.openai.key, (process.env.OPENAI_MODELS ?? 'gpt-4o-mini,gpt-4o').split(',')),
     gem,
-    ghm,
   ];
   for (const [n, base, key, model] of fb) {
     const p = new OpenAICompat(n, base, key, [model]);
