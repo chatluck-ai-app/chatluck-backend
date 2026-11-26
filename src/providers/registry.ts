@@ -8,11 +8,18 @@ export function buildProviders(): Provider[] {
     ['openrouter', 'https://openrouter.ai/api/v1', process.env.OPENROUTER_API_KEY ?? '', process.env.OPENROUTER_MODEL ?? 'meta-llama/llama-3.3-70b-instruct:free'],
     ['huggingface', 'https://router.huggingface.co/v1', process.env.HF_TOKEN ?? '', process.env.HF_MODEL ?? 'meta-llama/Llama-3.3-70B-Instruct'],
   ];
-  for (const [n, base, key, model] of fb) gem.fallbacks.push({ p: new OpenAICompat(n, base, key, [model]), model });
-  return [
+  const out: Provider[] = [
     new OpenAICompat('openai', config.openai.base, config.openai.key, (process.env.OPENAI_MODELS ?? 'gpt-4o-mini,gpt-4o').split(',')),
     gem,
   ];
+  for (const [n, base, key, model] of fb) {
+    const p = new OpenAICompat(n, base, key, [model]);
+    gem.fallbacks.push({ p, model });
+    // Also directly selectable as "<n>:<model>" when its key is set (unconfigured
+    // providers list no models, so this adds no noise when the key is absent).
+    out.push(p);
+  }
+  return out;
 }
 export class ModelRegistry {
   cache: ProviderModel[] = []; at = 0;
