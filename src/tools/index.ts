@@ -117,6 +117,10 @@ const createDoc: Tool = {
   },
 };
 
+// Drop anything before the XML declaration or first tag: model output often
+// prepends prose/blank lines to .xml files, which fails the real build with
+// "Content is not allowed in prolog".
+export const sanitizeXmlContent = (c: string): string => { let i = c.indexOf('<?xml'); if (i < 0) i = c.indexOf('<'); return i > 0 ? c.slice(i) : c; };
 const SAFE_PATH = (p: string) => typeof p === 'string' && p.length > 0 && p.length <= 200 && !p.startsWith('/') && !p.includes('\\') && !p.split('/').some(x => x === '..' || x === '' || x === '.') && !/[\x00-\x1f]/.test(p);
 const projectWrite: Tool = {
   name: 'project_write', description: 'Save source files into the project being generated (accumulates across calls; same path overwrites). Max 15 files and 60000 chars per file per call. Write COMPLETE files, no placeholders. Paths are relative like app/src/main/AndroidManifest.xml.',
@@ -132,7 +136,7 @@ const projectWrite: Tool = {
       added += f.content.length;
     }
     if (Number(tot.c) + files.length > 1000 || Number(tot.b) + added > 6_000_000) throw new Error('project size limit reached (1000 files / 6 MB)');
-    for (const f of files) { let c: string = f.content.replace(/^\uFEFF/, ''); const m = c.match(/^\s*```[a-zA-Z0-9]*\r?\n([\s\S]*?)\r?\n?```\s*$/); if (m) c = m[1]; if (/\.xml$/.test(f.path)) c = c.replace(/^\s+(?=<)/, ''); f.content = c; }
+    for (const f of files) { let c: string = f.content.replace(/^\uFEFF/, ''); const m = c.match(/^\s*```[a-zA-Z0-9]*\r?\n([\s\S]*?)\r?\n?```\s*$/); if (m) c = m[1]; if (/\.xml$/.test(f.path)) c = sanitizeXmlContent(c); f.content = c; }
     const same: string[] = [];
     for (const f of files) { const ex: any = await ctx.db.get('SELECT content FROM project_files WHERE task_id=? AND path=?', ctx.taskId, f.path); if (ex && ex.content === f.content) same.push(f.path); }
     for (const f of files) { await ctx.db.run('DELETE FROM project_files WHERE task_id=? AND path=?', ctx.taskId, f.path); await ctx.db.run('INSERT INTO project_files(task_id,path,content) VALUES(?,?,?)', ctx.taskId, f.path, f.content); }
