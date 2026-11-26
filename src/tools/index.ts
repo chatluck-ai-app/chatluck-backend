@@ -121,11 +121,15 @@ const createDoc: Tool = {
 // prepends prose/blank lines to .xml files, which fails the real build with
 // "Content is not allowed in prolog".
 export const sanitizeXmlContent = (c: string): string => { let i = c.indexOf('<?xml'); if (i < 0) i = c.indexOf('<'); return i > 0 ? c.slice(i) : c; };
+// History compaction placeholder. Weak models copy it into NEW project_write
+// calls as real content, corrupting the project; project_write rejects it.
+export const HISTORY_OMITTED = '(full file text saved; omitted from history. NEVER copy this string as file content: always send the complete file text)';
+export const PLACEHOLDER_CONTENT = /^\s*(\[saved\]|\(full file text saved[^)]*\))\s*$/i;
 const SAFE_PATH = (p: string) => typeof p === 'string' && p.length > 0 && p.length <= 200 && !p.startsWith('/') && !p.includes('\\') && !p.split('/').some(x => x === '..' || x === '' || x === '.') && !/[\x00-\x1f]/.test(p);
 const projectWrite: Tool = {
   name: 'project_write', description: 'Save source files into the project being generated (accumulates across calls; same path overwrites). Max 15 files and 60000 chars per file per call. Write COMPLETE files, no placeholders. Paths are relative like app/src/main/AndroidManifest.xml.',
   parameters: { type: 'object', properties: { files: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } }, required: ['files'] },
-  compactArgs: (a) => ({ files: (a?.files ?? []).map((f: any) => ({ path: f?.path, content: '[saved]' })) }),
+  compactArgs: (a) => ({ files: (a?.files ?? []).map((f: any) => ({ path: f?.path, content: HISTORY_OMITTED })) }),
   async run({ files }, ctx) {
     if (!Array.isArray(files) || !files.length || files.length > 15) throw new Error('send 1 to 15 files per call');
     const tot: any = await ctx.db.get('SELECT count(*) c, COALESCE(sum(length(content)),0) b FROM project_files WHERE task_id=?', ctx.taskId);
@@ -133,10 +137,11 @@ const projectWrite: Tool = {
     for (const f of files) {
       if (!SAFE_PATH(f?.path)) throw new Error('invalid path: ' + String(f?.path).slice(0, 80));
       if (typeof f.content !== 'string' || f.content.length > 60000) throw new Error('bad or too large content for ' + f.path);
+      if (PLACEHOLDER_CONTENT.test(f.content)) throw new Error('"' + f.path + '": you sent a history placeholder instead of the file\'s real content. ALWAYS send the COMPLETE file text in project_write, even for files written in earlier calls.');
       added += f.content.length;
     }
     if (Number(tot.c) + files.length > 1000 || Number(tot.b) + added > 6_000_000) throw new Error('project size limit reached (1000 files / 6 MB)');
-    for (const f of files) { let c: string = f.content.replace(/^\uFEFF/, ''); const m = c.match(/^\s*```[a-zA-Z0-9]*\r?\n([\s\S]*?)\r?\n?```\s*$/); if (m) c = m[1]; if (/\.xml$/.test(f.path)) c = sanitizeXmlContent(c); f.content = c; }
+    for (const f of files) { let c: string = f.content.replace(/^\uFEFF/, ''); const m = c.match(/^\s*```[a-zA-Z0-9]*\r?\n([\s\S]*?)\r?\n?```\s*$/); if (m) c = m[1]; if (/\.xml$/.test(f.path)) { c = sanitizeXmlContent(c); if (!c.startsWith('<')) throw new Error('"' + f.path + '": not valid XML (must start with <?xml or a tag). Send the complete file text.'); } f.content = c; }
     const same: string[] = [];
     for (const f of files) { const ex: any = await ctx.db.get('SELECT content FROM project_files WHERE task_id=? AND path=?', ctx.taskId, f.path); if (ex && ex.content === f.content) same.push(f.path); }
     for (const f of files) { await ctx.db.run('DELETE FROM project_files WHERE task_id=? AND path=?', ctx.taskId, f.path); await ctx.db.run('INSERT INTO project_files(task_id,path,content) VALUES(?,?,?)', ctx.taskId, f.path, f.content); }
