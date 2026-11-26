@@ -13,12 +13,16 @@ export class OpenAICompat implements Provider {
     if (!this.configured()) return [];
     const out: ProviderModel[] = [];
     for (const id of this.candidates) {
-      try {
-        const r = await fetch(this.base + '/chat/completions', { method: 'POST', headers: this.headers(),
-          body: JSON.stringify({ model: id, messages: [{ role: 'user', content: 'ping' }], max_tokens: 4 }), signal: AbortSignal.timeout(20000) });
-        if (r.ok) out.push({ id, provider: this.name, label: id });
-        else console.warn('[models] ' + this.name + '/' + id + ' -> ' + r.status + ' ' + (await r.text().catch(() => '')).slice(0, 160));
-      } catch (e) { console.warn('[models] ' + this.name + '/' + id + ' -> ' + String(e)); }
+      // Try every key: model availability can differ per API project, so a 404
+      // on the primary key does not mean another key cannot serve the model.
+      for (let k = 0; k < Math.max(1, this.keys.length); k++) {
+        try {
+          const r = await fetch(this.base + '/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + (this.keys[k] ?? this.key) },
+            body: JSON.stringify({ model: id, messages: [{ role: 'user', content: 'ping' }], max_tokens: 4 }), signal: AbortSignal.timeout(20000) });
+          if (r.ok) { out.push({ id, provider: this.name, label: id }); break; }
+          console.warn('[models] ' + this.name + '/' + id + ' key' + k + ' -> ' + r.status + ' ' + (await r.text().catch(() => '')).slice(0, 160));
+        } catch (e) { console.warn('[models] ' + this.name + '/' + id + ' key' + k + ' -> ' + String(e)); }
+      }
     }
     return out;
   }
