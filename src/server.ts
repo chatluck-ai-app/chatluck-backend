@@ -169,6 +169,18 @@ export async function buildApp(opts: { db?: Db; providers?: Provider[]; telegram
   });
 
   const svc = makeService(db, registry); registerPhase2(app, db, svc, U);
+  // Resume tasks orphaned by a previous process (deploy/restart/OOM): their rows
+  // still say "running" and their state is persisted per step. The old process is
+  // gone by the time this one boots, so nothing here can double-run.
+  app.addHook('onReady', async () => {
+    try {
+      const orphans = await db.all("SELECT id FROM tasks WHERE status='running'") as any[];
+      for (const o of orphans) {
+        const x = await svc.restart(o.id, () => {}, new AbortController().signal).catch(() => null);
+        if (x) { void x.run().catch((e: any) => app.log.warn({ err: String(e?.message), task: o.id }, 'orphan resume failed')); app.log.info({ task: o.id }, 'resumed orphaned task'); }
+      }
+    } catch (e: any) { app.log.warn({ err: String(e?.message) }, 'orphan resume sweep failed'); }
+  });
   const tgCfg = opts.telegram ?? (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_PAIRING_CODE ? { token: process.env.TELEGRAM_BOT_TOKEN, pairingCode: process.env.TELEGRAM_PAIRING_CODE } : undefined);
   const telegram = tgCfg ? registerTelegram(app, db, svc, tgCfg) : undefined;
   if (telegram && !opts.telegram && process.env.PUBLIC_URL) app.addHook('onReady', async () => { try { await telegram.setup(process.env.PUBLIC_URL!); } catch (e: any) { app.log.error({ err: String(e?.message) }, 'telegram setup failed'); } });
